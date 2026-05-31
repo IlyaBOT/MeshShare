@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import socket
 import ssl
+import sys
 from dataclasses import dataclass
 from threading import RLock
 from typing import Callable, Optional, Union
@@ -12,6 +13,7 @@ from .protocol import MAX_FRAME_BYTES, ProtocolError, frame_len
 
 Destination = Union[int, str]
 SERIAL_SPEEDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
+_BLE_DEVICE_CACHE: dict[str, object] = {}
 
 
 @dataclass(frozen=True)
@@ -459,6 +461,8 @@ def scan_bluetooth_devices() -> list[BluetoothDevice]:
         if not address:
             continue
         name = getattr(device, "name", "") or address
+        _BLE_DEVICE_CACHE[address] = device
+        _BLE_DEVICE_CACHE[name] = device
         devices.append(BluetoothDevice(name=name, address=address))
     return sorted(devices, key=lambda device: (device.name.lower(), device.address.lower()))
 
@@ -867,25 +871,164 @@ def _open_serial_interface(serial_interface_module, dev_path: Optional[str], bau
 def _open_ble_interface(address: Optional[str], pin: str):
     import meshtastic.ble_interface
 
-    if not pin:
+    device = _cached_ble_device(address)
+
+    if not pin and device is None:
         return meshtastic.ble_interface.BLEInterface(address)
+
+    if pin and sys.platform == "darwin":
+        raise RuntimeError(
+            "Bluetooth pairing with a PIN is not available from MeshShare on macOS. "
+            "Connect without a PIN and use the macOS system pairing prompt if it appears."
+        )
 
     class PairingBLEInterface(meshtastic.ble_interface.BLEInterface):
         def connect(self, address: Optional[str] = None):
-            device = self.find_device(address)
+            target = device or self.find_device(address)
+            target = _ble_client_target(address, target)
             client = meshtastic.ble_interface.BLEClient(
-                device.address,
+                target,
                 disconnected_callback=lambda _: self.close(),
+                pair=_ble_pair_before_connect(),
             )
             client.connect()
-            try:
-                client.pair(passkey=pin)
-            except TypeError:
-                client.pair()
+            if pin:
+                try:
+                    client.pair(passkey=pin)
+                except TypeError:
+                    client.pair()
             client.discover()
+            client = _wrap_ble_client(client, meshtastic.ble_interface)
+            _prepare_macos_ble_connection(client, meshtastic.ble_interface, self.from_num_handler)
             return client
 
     return PairingBLEInterface(address)
+
+
+def _cached_ble_device(address: Optional[str]) -> Optional[object]:
+    if not address:
+        return None
+    return _BLE_DEVICE_CACHE.get(address)
+
+
+def _ble_client_target(address: Optional[str], device: object) -> object:
+    if sys.platform == "darwin" and address:
+        return address
+    return device
+
+
+def _ble_pair_before_connect() -> bool:
+    return sys.platform == "darwin"
+
+
+def _wrap_ble_client(client, ble_interface_module):
+    if sys.platform != "darwin":
+        return client
+    disabled_notify_uuids = {
+        str(getattr(ble_interface_module, "LEGACY_LOGRADIO_UUID", "")),
+        str(getattr(ble_interface_module, "LOGRADIO_UUID", "")),
+    }
+    toradio_uuid = str(getattr(ble_interface_module, "TORADIO_UUID", ""))
+    return _MacOSBLEClient(client, disabled_notify_uuids, toradio_uuid)
+
+
+def _prepare_macos_ble_connection(client, ble_interface_module, from_num_handler) -> None:
+    if sys.platform != "darwin":
+        return
+    fromnum_uuid = getattr(ble_interface_module, "FROMNUM_UUID", None)
+    if fromnum_uuid is not None and client.has_characteristic(fromnum_uuid):
+        client.start_notify(fromnum_uuid, from_num_handler)
+
+
+class _MacOSBLEClient:
+    def __init__(self, client, disabled_notify_uuids: set[str], toradio_uuid: str) -> None:
+        self._client = client
+        self._disabled_notify_uuids = disabled_notify_uuids
+        self._toradio_uuid = toradio_uuid.lower()
+
+    def __getattr__(self, name: str):
+        return getattr(self._client, name)
+
+    def has_characteristic(self, specifier) -> bool:
+        if str(specifier) in self._disabled_notify_uuids:
+            return False
+        return self._client.has_characteristic(specifier)
+
+    def start_notify(self, specifier, *args, **kwargs):
+        return _retry_ble_pairing_operation(lambda: self._client.start_notify(specifier, *args, **kwargs))
+
+    def write_gatt_char(self, specifier, data, *args, **kwargs):
+        kwargs = self._apple_write_kwargs(specifier, kwargs)
+        return _retry_ble_pairing_operation(lambda: self._client.write_gatt_char(specifier, data, *args, **kwargs))
+
+    def _apple_write_kwargs(self, specifier, kwargs: dict) -> dict:
+        if _characteristic_uuid(specifier) != self._toradio_uuid:
+            return kwargs
+        characteristic = _resolve_characteristic(self._client, specifier)
+        if not _supports_write_without_response(characteristic or specifier):
+            return kwargs
+        updated = dict(kwargs)
+        updated["response"] = False
+        return updated
+
+
+def _retry_ble_pairing_operation(operation, attempts: int = 6, delay_seconds: float = 1.0):
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception as exc:
+            if not _looks_like_ble_encryption_error(exc):
+                raise
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(delay_seconds)
+    raise RuntimeError(
+        "Bluetooth pairing/encryption is still not ready. If macOS showed a pairing prompt, "
+        "accept it and try connecting again. If no prompt appeared, toggle Bluetooth off/on "
+        "or forget/remove the node from known Bluetooth devices and retry."
+    ) from last_error
+
+
+def _looks_like_ble_encryption_error(exc: Exception) -> bool:
+    message = _exception_chain_text(exc).lower()
+    return (
+        "encryption is insufficient" in message
+        or "insufficient encryption" in message
+        or "cbatterrordomain code=15" in message
+    )
+
+
+def _characteristic_uuid(specifier) -> str:
+    return str(getattr(specifier, "uuid", specifier)).lower()
+
+
+def _supports_write_without_response(specifier) -> bool:
+    properties = getattr(specifier, "properties", ()) or ()
+    return "write-without-response" in properties or "write_without_response" in properties
+
+
+def _resolve_characteristic(client, specifier):
+    if hasattr(specifier, "properties"):
+        return specifier
+    bleak_client = getattr(client, "bleak_client", None)
+    services = getattr(bleak_client, "services", None)
+    get_characteristic = getattr(services, "get_characteristic", None)
+    if get_characteristic is None:
+        return None
+    try:
+        return get_characteristic(specifier)
+    except Exception:
+        return None
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    parts = []
+    current: Optional[BaseException] = exc
+    while current is not None:
+        parts.append(str(current))
+        current = current.__cause__ or current.__context__
+    return " ".join(parts)
 
 
 def _open_tcp_interface(tcp_interface_module, host: str, port: int, use_https: bool):

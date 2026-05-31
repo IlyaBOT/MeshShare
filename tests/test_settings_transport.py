@@ -2,16 +2,34 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from meshtastic import mesh_pb2
 from meshshare.app import ChatRecord, MainMenuScreen, MeshShareApp
-from meshshare.app import _format_device_status, _format_reactions, _line_with_reactions, _system_emoji_choices
+from meshshare.app import (
+    _format_device_status,
+    _format_reactions,
+    _connection_error_message,
+    _ble_pin_prompt_supported,
+    _line_with_reactions,
+    _looks_like_pairing_required,
+    _system_emoji_choices,
+)
 from meshshare.settings import SavedSettings
 from meshshare.transport import (
     ChannelInfo,
     LocalNodeStatus,
     MeshtasticTransport,
     NodeTarget,
+    _ble_client_target,
+    _ble_pair_before_connect,
+    _characteristic_uuid,
+    _exception_chain_text as _transport_exception_chain_text,
+    _looks_like_ble_encryption_error,
+    _prepare_macos_ble_connection,
+    _retry_ble_pairing_operation,
+    _resolve_characteristic,
+    _wrap_ble_client,
     _send_traceroute_with_result,
     parse_tcp_endpoint,
 )
@@ -222,6 +240,150 @@ class DeviceStatusTests(unittest.TestCase):
         status = _format_device_status("Very Long Meshtastic Node Name", "Bluetooth", "90% 4.05V", max_width=37)
 
         self.assertEqual(status, "Very Long... | Bluetooth | 90% 4.05V")
+
+
+class BluetoothPairingErrorTests(unittest.TestCase):
+    def test_pairing_required_detection_ignores_core_bluetooth_unavailable(self):
+        self.assertTrue(_looks_like_pairing_required(RuntimeError("Authentication failed: passkey required")))
+        self.assertTrue(_looks_like_pairing_required(RuntimeError("Encryption is insufficient.")))
+        self.assertFalse(_looks_like_pairing_required(RuntimeError("Pairing is not available in Core Bluetooth")))
+
+    def test_pin_prompt_is_disabled_on_macos(self):
+        with patch("meshshare.app.sys.platform", "darwin"):
+            self.assertFalse(_ble_pin_prompt_supported())
+
+    def test_encryption_error_explains_macos_pairing(self):
+        message = _connection_error_message(RuntimeError("Encryption is insufficient."))
+        self.assertIn("system pairing prompt", message)
+
+    def test_ble_client_target_uses_address_on_macos(self):
+        device = object()
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            self.assertEqual(_ble_client_target("AA:BB", device), "AA:BB")
+
+    def test_ble_pair_before_connect_enabled_on_macos(self):
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            self.assertTrue(_ble_pair_before_connect())
+
+    def test_macos_ble_wrapper_disables_optional_log_notifications(self):
+        class FakeClient:
+            def __init__(self):
+                self.write_kwargs = None
+
+            def has_characteristic(self, specifier):
+                return True
+
+            def write_gatt_char(self, *args, **kwargs):
+                self.write_kwargs = kwargs
+                return "written"
+
+        fake_client = FakeClient()
+        fake_module = SimpleNamespace(LEGACY_LOGRADIO_UUID="legacy-log", LOGRADIO_UUID="log-radio", TORADIO_UUID="to-radio")
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            wrapped = _wrap_ble_client(fake_client, fake_module)
+
+        self.assertFalse(wrapped.has_characteristic("legacy-log"))
+        self.assertFalse(wrapped.has_characteristic("log-radio"))
+        self.assertTrue(wrapped.has_characteristic("from-num"))
+        self.assertEqual(wrapped.write_gatt_char("to-radio", b"x"), "written")
+
+    def test_macos_ble_wrapper_prefers_toradio_write_without_response(self):
+        class FakeCharacteristic:
+            uuid = "to-radio"
+            properties = ["write", "write-without-response"]
+
+        class FakeClient:
+            def __init__(self):
+                self.write_kwargs = None
+
+            def write_gatt_char(self, *args, **kwargs):
+                self.write_kwargs = kwargs
+
+        fake_client = FakeClient()
+        fake_module = SimpleNamespace(LEGACY_LOGRADIO_UUID="legacy-log", LOGRADIO_UUID="log-radio", TORADIO_UUID="to-radio")
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            wrapped = _wrap_ble_client(fake_client, fake_module)
+        wrapped.write_gatt_char(FakeCharacteristic(), b"x", response=True)
+
+        self.assertEqual(fake_client.write_kwargs, {"response": False})
+
+    def test_macos_ble_wrapper_resolves_string_toradio_characteristic(self):
+        class FakeCharacteristic:
+            uuid = "to-radio"
+            properties = ["write", "write-without-response"]
+
+        class FakeServices:
+            def get_characteristic(self, specifier):
+                return FakeCharacteristic() if specifier == "to-radio" else None
+
+        class FakeClient:
+            def __init__(self):
+                self.write_kwargs = None
+                self.bleak_client = SimpleNamespace(services=FakeServices())
+
+            def write_gatt_char(self, *args, **kwargs):
+                self.write_kwargs = kwargs
+
+        fake_client = FakeClient()
+        fake_module = SimpleNamespace(LEGACY_LOGRADIO_UUID="legacy-log", LOGRADIO_UUID="log-radio", TORADIO_UUID="to-radio")
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            wrapped = _wrap_ble_client(fake_client, fake_module)
+        wrapped.write_gatt_char("to-radio", b"x", response=True)
+
+        self.assertEqual(fake_client.write_kwargs, {"response": False})
+        self.assertIsInstance(_resolve_characteristic(fake_client, "to-radio"), FakeCharacteristic)
+
+    def test_characteristic_uuid_accepts_string_or_characteristic(self):
+        self.assertEqual(_characteristic_uuid("ABC"), "abc")
+        self.assertEqual(_characteristic_uuid(SimpleNamespace(uuid="ABC")), "abc")
+
+    def test_ble_encryption_error_detection_reads_exception_causes(self):
+        inner = RuntimeError("CBATTErrorDomain Code=15")
+        outer = RuntimeError("Error writing BLE")
+        outer.__cause__ = inner
+
+        self.assertIn("CBATTErrorDomain", _transport_exception_chain_text(outer))
+        self.assertTrue(_looks_like_ble_encryption_error(outer))
+
+    def test_prepare_macos_ble_connection_starts_fromnum_notification(self):
+        class FakeClient:
+            def __init__(self):
+                self.notifications = []
+
+            def has_characteristic(self, specifier):
+                return True
+
+            def start_notify(self, specifier, handler):
+                self.notifications.append((specifier, handler))
+
+        client = FakeClient()
+        module = SimpleNamespace(FROMRADIO_UUID="from-radio", FROMNUM_UUID="from-num")
+        handler = object()
+        with patch("meshshare.transport.sys.platform", "darwin"):
+            _prepare_macos_ble_connection(client, module, handler)
+
+        self.assertEqual([item[0] for item in client.notifications], ["from-num"])
+        self.assertIs(client.notifications[0][1], handler)
+
+    def test_ble_encryption_error_detection(self):
+        self.assertTrue(_looks_like_ble_encryption_error(RuntimeError("CBATTErrorDomain Code=15")))
+        self.assertTrue(_looks_like_ble_encryption_error(RuntimeError("Encryption is insufficient.")))
+        self.assertFalse(_looks_like_ble_encryption_error(RuntimeError("Not connected")))
+
+    def test_ble_pairing_operation_retries_encryption_error(self):
+        calls = 0
+
+        def operation():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("Encryption is insufficient.")
+            return "ok"
+
+        result = _retry_ble_pairing_operation(operation, attempts=2, delay_seconds=0)
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(calls, 2)
 
 
 class MainMenuNodeLoadingTests(unittest.IsolatedAsyncioTestCase):

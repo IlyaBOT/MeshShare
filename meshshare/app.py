@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import shutil
+import sys
 import threading
 import unicodedata
 from dataclasses import dataclass, field
@@ -283,6 +284,42 @@ class EmojiSelectScreen(ModalScreen[str]):
         )
 
 
+class BluetoothPinScreen(ModalScreen[Optional[str]]):
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, device_name: str) -> None:
+        super().__init__()
+        self.device_name = device_name
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Static(f'Enter PIN code for "{self.device_name}"', id="dialog-text")
+            yield Input(placeholder="PIN code", password=True, id="pin-input")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Pair and connect", id="pair", variant="primary")
+                yield Button("Cancel", id="cancel", variant="error")
+
+    def on_mount(self) -> None:
+        self.query_one("#pin-input", Input).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self._submit_pin()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "pin-input":
+            self._submit_pin()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _submit_pin(self) -> None:
+        pin = self.query_one("#pin-input", Input).value.strip()
+        self.dismiss(pin or None)
+
+
 class ConnectionScreen(ModalScreen[None]):
     BINDINGS = [
         ("left", "previous_tab", "Previous"),
@@ -325,7 +362,6 @@ class ConnectionScreen(ModalScreen[None]):
                 yield OptionList(id="paired-list")
                 yield Static("=== Devices ===", classes="section-title")
                 yield OptionList(id="ble-list")
-                yield Input(placeholder="PIN code, if required", password=True, id="ble-pin")
                 with Horizontal(classes="center-row connect-button-row"):
                     yield Button("Scan", id="ble-scan", variant="primary", classes="center-button")
                 yield Static("Select device with arrows and press Enter.", id="ble-help")
@@ -358,13 +394,15 @@ class ConnectionScreen(ModalScreen[None]):
             await self._connect(self._tcp_config())
 
     async def _connect(self, config: ConnectionConfig) -> None:
-        self.query_one("#connect-status", Static).update("Connecting...")
         try:
-            await self.app.connect_to_node(config)  # type: ignore[attr-defined]
+            await self._connect_or_raise(config)
         except Exception as exc:
             self.query_one("#connect-status", Static).update("Connection error!")
-            self.app.show_error(f"ERROR! {exc}")  # type: ignore[attr-defined]
-            return
+            self.app.show_error(f"ERROR! {_connection_error_message(exc)}")  # type: ignore[attr-defined]
+
+    async def _connect_or_raise(self, config: ConnectionConfig) -> None:
+        self.query_one("#connect-status", Static).update("Connecting...")
+        await self.app.connect_to_node(config)  # type: ignore[attr-defined]
         self.dismiss(None)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -372,12 +410,12 @@ class ConnectionScreen(ModalScreen[None]):
         if option_id.startswith("paired:"):
             address = option_id.removeprefix("paired:")
             name = _option_prompt_text(event.option)
-            asyncio.create_task(self._connect(self._ble_config(address, name)))
+            asyncio.create_task(self._connect_ble_device(address, name))
         elif option_id.startswith("ble:"):
             address = option_id.removeprefix("ble:")
             device = self.ble_devices.get(address)
             name = device.name if device else address
-            asyncio.create_task(self._connect(self._ble_config(address, name)))
+            asyncio.create_task(self._connect_ble_device(address, name))
 
     def action_previous_tab(self) -> None:
         index = self.TAB_ORDER.index(self.active_tab)
@@ -442,6 +480,39 @@ class ConnectionScreen(ModalScreen[None]):
         if devices:
             device_list.focus()
 
+    async def _connect_ble_device(self, address: str, name: str) -> None:
+        config = self._ble_config(address, name)
+        try:
+            await self._connect_or_raise(config)
+            return
+        except Exception as exc:
+            if not _looks_like_pairing_required(exc):
+                self.query_one("#connect-status", Static).update("Connection error!")
+                self.app.show_error(f"ERROR! {_connection_error_message(exc)}")  # type: ignore[attr-defined]
+                return
+            if not _ble_pin_prompt_supported():
+                self.query_one("#connect-status", Static).update("Pairing required.")
+                self.app.show_error(f"ERROR! {_connection_error_message(exc)}")  # type: ignore[attr-defined]
+                return
+
+        self.query_one("#connect-status", Static).update("PIN required.")
+        pin = await self._request_ble_pin(name)
+        if not pin:
+            self.query_one("#connect-status", Static).update("Connection cancelled.")
+            return
+        await self._connect(ConnectionConfig(kind="ble", endpoint=address, pin=pin, name=name))
+
+    async def _request_ble_pin(self, name: str) -> Optional[str]:
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Optional[str]] = loop.create_future()
+
+        def on_pin(pin: Optional[str]) -> None:
+            if not future.done():
+                future.set_result(pin)
+
+        self.app.push_screen(BluetoothPinScreen(name), callback=on_pin)  # type: ignore[attr-defined]
+        return await future
+
     async def _test_tcp(self) -> None:
         endpoint = self.query_one("#tcp-endpoint", Input).value.strip()
         use_https = self.query_one("#tcp-https", Checkbox).value
@@ -463,8 +534,7 @@ class ConnectionScreen(ModalScreen[None]):
         return ConnectionConfig(kind="serial", endpoint=device, baudrate=baudrate)
 
     def _ble_config(self, address: str, name: str) -> ConnectionConfig:
-        pin = self.query_one("#ble-pin", Input).value.strip()
-        return ConnectionConfig(kind="ble", endpoint=address, pin=pin, name=name)
+        return ConnectionConfig(kind="ble", endpoint=address, name=name)
 
     def _tcp_config(self) -> ConnectionConfig:
         endpoint = self.query_one("#tcp-endpoint", Input).value.strip()
@@ -2197,6 +2267,58 @@ def _option_prompt_text(option: Option) -> str:
 
 def _connection_label(kind: str) -> str:
     return {"serial": "Serial", "ble": "Bluetooth", "tcp": "TCP"}.get(kind, kind)
+
+
+def _looks_like_pairing_required(exc: Exception) -> bool:
+    message = _exception_chain_text(exc).lower()
+    pairing_keywords = (
+        "pair",
+        "passkey",
+        "pin",
+        "authentication",
+        "authorize",
+        "bond",
+        "insufficient encryption",
+        "encryption is insufficient",
+    )
+    unavailable_keywords = (
+        "not available in core bluetooth",
+        "not supported",
+        "unavailable",
+    )
+    return any(keyword in message for keyword in pairing_keywords) and not any(
+        keyword in message for keyword in unavailable_keywords
+    )
+
+
+def _ble_pin_prompt_supported() -> bool:
+    return sys.platform != "darwin"
+
+
+def _connection_error_message(exc: Exception) -> str:
+    message = _exception_chain_text(exc)
+    message_lower = message.lower()
+    if (
+        "not available in core bluetooth" in message_lower
+        or "encryption is insufficient" in message_lower
+        or "error writing ble" in message_lower
+    ):
+        return (
+            "This Bluetooth node requires pairing/encryption. macOS does not allow MeshShare "
+            "to enter a BLE PIN inside the terminal UI; CoreBluetooth must show the system "
+            "pairing prompt during connect. If no prompt appears, retry after toggling Bluetooth "
+            "off/on or forget/remove the node from known Bluetooth devices."
+        )
+    return message
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    parts = []
+    current: Optional[BaseException] = exc
+    while current is not None:
+        parts.append(str(current))
+        current = current.__cause__ or current.__context__
+    return " ".join(parts)
 
 
 def format_duration(seconds: float) -> str:

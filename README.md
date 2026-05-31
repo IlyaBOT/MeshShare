@@ -17,29 +17,157 @@ MeshShare is intended for experiments with low-bandwidth, off-grid file exchange
 - Temporary file assembly before saving
 - Compatible with any regular Meshtastic node - no custom firmware required!
 
+## Requirements
+
+- Python 3.11 or newer
+- `pip` and `venv`
+- A Meshtastic node reachable over USB serial, Bluetooth LE, or TCP
+
+On Linux, install Tkinter if you want to use the graphical file picker:
+
+```bash
+sudo apt install python3-tk
+```
+
+On macOS, the Python installer from python.org already includes Tkinter. If you
+use Homebrew Python and file dialogs do not open, install Python with Tk support
+or run MeshShare without the file dialog workflow.
+
 ## Install
 
-```powershell
-python -m pip install -e .
+```bash
+python3 -m pip install -e .
 ```
 
 ## Run
 
-```powershell
+```bash
 meshshare
 ```
 
 or:
 
-```powershell
-python -m meshshare
+```bash
+python3 -m meshshare
 ```
 
 Optional temp directory:
 
-```powershell
-python -m meshshare --temp-dir temp
+```bash
+python3 -m meshshare --temp-dir temp
 ```
+
+## Run on Linux
+
+1. Clone the repository and enter it:
+
+```bash
+git clone <repo-url>
+cd MeshShare
+```
+
+2. Create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+3. Upgrade `pip` and install MeshShare:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+4. If you connect to the radio over USB serial, make sure your user can access
+the serial device:
+
+```bash
+sudo usermod -aG dialout "$USER"
+```
+
+Log out and log back in after changing groups. On some distributions the group
+can be `uucp` or `tty` instead of `dialout`.
+
+5. Start MeshShare:
+
+```bash
+meshshare
+```
+
+If the command is not found, use:
+
+```bash
+python -m meshshare
+```
+
+## Run on macOS
+
+1. Clone the repository and enter it:
+
+```bash
+git clone <repo-url>
+cd MeshShare
+```
+
+2. Create and activate a virtual environment:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+3. Upgrade `pip` and install MeshShare:
+
+```bash
+python -m pip install --upgrade pip
+python -m pip install -e .
+```
+
+4. Start MeshShare:
+
+```bash
+meshshare
+```
+
+If the command is not found, use:
+
+```bash
+python -m meshshare
+```
+
+For USB serial connections, macOS usually exposes the Meshtastic device as
+`/dev/tty.usbserial-*`, `/dev/tty.usbmodem*`, or `/dev/cu.*`. No extra group
+setup is normally required.
+
+## Connection Notes
+
+- Serial: connect the Meshtastic node over USB and select the serial device in
+  the MeshShare UI.
+- Bluetooth LE: enable Bluetooth on the computer and the Meshtastic node, then
+  scan/select the node in the MeshShare UI.
+- TCP: use this when the Meshtastic node is reachable through a network host.
+  The default Meshtastic TCP port is `4403`.
+
+## Troubleshooting
+
+### macOS Bluetooth pairing
+
+macOS does not allow Python/Bleak/CoreBluetooth applications to enter a BLE PIN
+inside the terminal UI. BLE-only Meshtastic nodes often do not appear in
+`System Settings > Bluetooth`; pairing is normally triggered from the app during
+connection.
+
+If MeshShare shows `Encryption is insufficient`:
+
+1. Leave the PIN field empty and connect from MeshShare.
+2. If macOS shows a system pairing prompt, enter the node PIN there.
+3. If no prompt appears, turn Bluetooth off/on and retry.
+4. If the node is listed in macOS Bluetooth settings, remove/forget it and retry
+   from MeshShare.
+
+If macOS still refuses to pair with the node, use USB serial or TCP instead.
 
 ## Protocol Notes
 
@@ -60,6 +188,6 @@ MeshShare to be running on both peers.
 
 ## Tests
 
-```powershell
-python -m unittest discover -s tests
+```bash
+python3 -m unittest discover -s tests
 ```
