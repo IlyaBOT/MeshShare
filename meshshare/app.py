@@ -57,7 +57,7 @@ class ConfirmSendScreen(ModalScreen[str]):
     def compose(self) -> ComposeResult:
         with Container(id="dialog"):
             yield Static(
-                f'Вы уверены что хотите отправить файл "{self.file_path.name}" '
+                f'Are you sure шо вы хотите отправить файл "{self.file_path.name}" '
                 f'пользователю "{self.node_name}"?',
                 id="dialog-text",
             )
@@ -72,20 +72,25 @@ class ConfirmSendScreen(ModalScreen[str]):
 
 
 class ReceiveOfferScreen(ModalScreen[bool]):
-    def __init__(self, offer: IncomingOffer) -> None:
+    def __init__(self, offer: IncomingOffer, timeout_seconds: int = 60) -> None:
         super().__init__()
         self.offer = offer
+        self.timeout_seconds = timeout_seconds
 
     def compose(self) -> ComposeResult:
         metadata = self.offer.metadata
         with Container(id="dialog"):
             yield Static(
-                f'Получить файл "{metadata.name}" размером {format_bytes(metadata.size)}?',
+                f'Получить файл "{metadata.name}" размером {format_bytes(metadata.size)}?\n'
+                f'Автоотмена через {self.timeout_seconds} секунд.',
                 id="dialog-text",
             )
             with Horizontal(classes="dialog-buttons"):
                 yield Button("Yes receive", id="yes", variant="success")
                 yield Button("No", id="no", variant="error")
+
+    def on_mount(self) -> None:
+        self.set_timer(self.timeout_seconds, lambda: self.dismiss(False))
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         self.dismiss(event.button.id == "yes")
@@ -608,12 +613,18 @@ class MainMenuScreen(Screen):
             return
         self.write_system(f"* Tracerout sended to {target.name}...")
         try:
-            result = await asyncio.to_thread(
-                self.app.transport.send_traceroute,  # type: ignore[attr-defined]
-                target.destination,
-                self.app.channel_index,  # type: ignore[attr-defined]
-                7,
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.app.transport.send_traceroute,  # type: ignore[attr-defined]
+                    target.destination,
+                    self.app.channel_index,  # type: ignore[attr-defined]
+                    7,
+                ),
+                timeout=25.0,
             )
+        except asyncio.TimeoutError:
+            self.write_system("* Traceroute timeout: no route reply in 25s")
+            return
         except Exception as exc:
             self.app.show_error(f"ERROR! Traceroute failed: {exc}")  # type: ignore[attr-defined]
             return
@@ -926,6 +937,7 @@ class MeshShareApp(App):
             on_incoming_offer=self._incoming_offer_from_worker,
             chunk_bytes=self.chunk_bytes,
             packet_delay=self.packet_delay,
+            offer_timeout=60.0,
         )
         transport.on_message = self._handle_mesh_message
         try:
@@ -987,6 +999,10 @@ class MeshShareApp(App):
                 self.show_error(message)
         except Exception:
             self._show_local_device_lost()
+        finally:
+            if isinstance(self.screen, MainMenuScreen):
+                self.screen.set_transmitting(False)
+            self.transfer_task = None
 
     def stop_transfer(self) -> None:
         if self.manager is not None:
@@ -1053,8 +1069,14 @@ class MeshShareApp(App):
                 return
             self.call_from_thread(self._append_incoming_chat, message)
             return
-        if self.manager is not None:
-            self.manager.handle_message(message)
+        manager = self.manager
+        if manager is not None:
+            threading.Thread(
+                target=manager.handle_message,
+                args=(message,),
+                name="MeshShareRxFrame",
+                daemon=True,
+            ).start()
 
     def _append_incoming_chat(self, message) -> None:
         if isinstance(self.screen, MainMenuScreen):
@@ -1078,10 +1100,10 @@ class MeshShareApp(App):
                     self.screen.clear_receive_waiting()
                 event.set()
 
-            self.push_screen(ReceiveOfferScreen(offer), callback=done)
+            self.push_screen(ReceiveOfferScreen(offer, timeout_seconds=60), callback=done)
 
         self.call_from_thread(ask_user)
-        if not event.wait(120):
+        if not event.wait(60):
             return False
         return result["accepted"]
 

@@ -146,6 +146,7 @@ class FileTransferManager:
         ack_every: int = 4,
         resend_after: float = 8.0,
         complete_timeout: float = 90.0,
+        offer_timeout: Optional[float] = None,
     ) -> None:
         self.transport = transport
         self.download_dir = download_dir
@@ -158,6 +159,7 @@ class FileTransferManager:
         self.ack_every = ack_every
         self.resend_after = resend_after
         self.complete_timeout = complete_timeout
+        self.offer_timeout = complete_timeout if offer_timeout is None else offer_timeout
         self._lock = threading.RLock()
         self._outgoing: dict[str, OutgoingSession] = {}
         self._incoming: dict[str, IncomingSession] = {}
@@ -507,7 +509,7 @@ class FileTransferManager:
             pass
 
     def _send_to_session(self, session: IncomingSession, frame: str) -> None:
-        self.transport.send_text(frame, session.sender, channel_index=session.channel_index, want_ack=True)
+        self.transport.send_text(frame, session.sender, channel_index=session.channel_index, want_ack=False)
         session.packets_sent += 1
 
     def _chunk_path(self, session: IncomingSession, index: int) -> Path:
@@ -539,8 +541,8 @@ class FileTransferManager:
         time.sleep(self.packet_delay * signal_factor(outgoing.signal_db))
 
     def _wait_for_accept(self, outgoing: OutgoingSession) -> None:
-        deadline = time.monotonic() + self.complete_timeout
-        self._emit_outgoing(outgoing, "waiting", "Waiting for receiver confirmation")
+        deadline = time.monotonic() + self.offer_timeout
+        self._emit_outgoing(outgoing, "waiting", f"Waiting for receiver confirmation ({int(self.offer_timeout)}s timeout)")
         while not outgoing.accept_event.is_set():
             self._raise_if_stopped(outgoing)
             if outgoing.error:
@@ -558,7 +560,7 @@ class FileTransferManager:
             frame,
             outgoing.target.destination,
             channel_index=outgoing.channel_index,
-            want_ack=True,
+            want_ack=False,
         )
         outgoing.packets_sent += 1
 
@@ -567,7 +569,7 @@ class FileTransferManager:
             encode_stop_frame(outgoing.session_id, reason),
             outgoing.target.destination,
             channel_index=outgoing.channel_index,
-            want_ack=True,
+            want_ack=False,
         )
         outgoing.packets_sent += 1
 

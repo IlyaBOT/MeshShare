@@ -149,15 +149,20 @@ class MeshtasticTransport:
         channel_index: int = 0,
         hop_limit: int = 7,
     ) -> TracerouteResult:
+        # Do not hold the transport lock while waiting for a traceroute reply.
+        # Some Meshtastic backends can block inside sendTraceRoute() when the
+        # route never comes back; keeping the lock would freeze node refresh,
+        # chat sends and the connection watchdog.
         with self._lock:
-            if self.interface is None:
-                raise RuntimeError("not connected to a Meshtastic node")
-            return _send_traceroute_with_result(
-                self.interface,
-                destination_id,
-                channel_index,
-                hop_limit,
-            )
+            interface = self.interface
+        if interface is None:
+            raise RuntimeError("not connected to a Meshtastic node")
+        return _send_traceroute_with_result(
+            interface,
+            destination_id,
+            channel_index,
+            hop_limit,
+        )
 
     def list_nodes(self) -> list[NodeTarget]:
         with self._lock:
