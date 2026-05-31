@@ -231,6 +231,55 @@ class MeshtasticTransport:
                 ),
             )
 
+    def find_node(
+        self,
+        from_id: Optional[Destination] = None,
+        from_node_num: Optional[int] = None,
+    ) -> Optional[NodeTarget]:
+        """Return a single node from the already-loaded Meshtastic node DB.
+
+        This is intentionally a cache lookup. It does not request a full node
+        refresh from the radio; the TUI uses it only to append newly-seen peers
+        without rebuilding the visible node list.
+        """
+        with self._lock:
+            interface = self.interface
+            if interface is None:
+                return None
+
+            if isinstance(from_node_num, int):
+                node = (getattr(interface, "nodesByNum", None) or {}).get(from_node_num)
+                if isinstance(node, dict) and not _is_self_node(interface, node):
+                    return _node_target_from_node(from_node_num, node)
+
+            if from_id is not None:
+                node_id = str(from_id)
+                by_id = getattr(interface, "nodes", None) or {}
+                node = by_id.get(node_id)
+                if isinstance(node, dict) and not _is_self_node(interface, node):
+                    return _node_target_from_node(node.get("num"), node, fallback_id=node_id)
+
+                for node_num, node in (getattr(interface, "nodesByNum", None) or {}).items():
+                    if not isinstance(node, dict) or _is_self_node(interface, node):
+                        continue
+                    user = node.get("user") or {}
+                    if str(user.get("id") or "") == node_id:
+                        return _node_target_from_node(node_num, node, fallback_id=node_id)
+                    if isinstance(node_num, int) and node_id == f"!{node_num:08x}":
+                        return _node_target_from_node(node_num, node, fallback_id=node_id)
+
+            if isinstance(from_node_num, int):
+                node_id = f"!{from_node_num:08x}"
+                return NodeTarget(
+                    destination=from_id if from_id is not None else from_node_num,
+                    node_id=node_id,
+                    name=node_id,
+                )
+            if from_id is not None:
+                node_id = str(from_id)
+                return NodeTarget(destination=from_id, node_id=node_id, name=node_id)
+            return None
+
     def list_channels(self) -> list[ChannelInfo]:
         with self._lock:
             interface = self.interface
@@ -279,17 +328,26 @@ class MeshtasticTransport:
                 return LocalNodeStatus()
             name = self.get_local_node_name()
             node = self._get_local_node_dict()
-            metrics = {}
-            if isinstance(node, dict):
-                metrics = node.get("deviceMetrics") or node.get("metrics") or {}
-            battery = metrics.get("batteryLevel") if isinstance(metrics, dict) else None
-            voltage = metrics.get("voltage") if isinstance(metrics, dict) else None
+            metrics = _node_device_metrics(node)
+            battery = _metric_value(metrics, "batteryLevel", "battery_level", "battery")
+            voltage = _metric_value(metrics, "voltage", "batteryVoltage", "battery_voltage")
+            powered_value = _metric_value(
+                metrics,
+                "powered",
+                "isPowered",
+                "is_powered",
+                "powerStatus",
+                "power_status",
+                "externalPower",
+                "external_power",
+            )
             battery_level = _as_int_optional(battery)
+            powered = _looks_powered(powered_value) or (battery_level is not None and battery_level > 100)
             return LocalNodeStatus(
                 name=name,
                 battery_level=battery_level,
                 voltage=_as_float(voltage),
-                powered=battery_level is not None and battery_level > 100,
+                powered=powered,
             )
 
     def _get_local_node_dict(self) -> Optional[dict]:
@@ -688,6 +746,47 @@ def _is_self_node(interface, node: dict) -> bool:
     local = getattr(interface, "localNode", None)
     local_num = getattr(local, "nodeNum", None)
     return local_num is not None and node.get("num") == local_num
+
+
+def _node_device_metrics(node: Optional[dict]) -> dict:
+    if not isinstance(node, dict):
+        return {}
+    candidates = [
+        node.get("deviceMetrics"),
+        node.get("device_metrics"),
+        node.get("metrics"),
+    ]
+    telemetry = node.get("telemetry")
+    if isinstance(telemetry, dict):
+        candidates.extend(
+            [
+                telemetry.get("deviceMetrics"),
+                telemetry.get("device_metrics"),
+                telemetry.get("metrics"),
+            ]
+        )
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+    return {}
+
+
+def _metric_value(metrics: dict, *keys: str):
+    for key in keys:
+        if key in metrics:
+            return metrics.get(key)
+    return None
+
+
+def _looks_powered(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        normalized = value.strip().lower().replace(" ", "_").replace("-", "_")
+        return normalized in {"powered", "external", "external_power", "usb", "mains", "true", "yes", "on"}
+    return False
 
 
 def _as_float(value) -> Optional[float]:

@@ -234,6 +234,11 @@ def is_protocol_like(text: str) -> bool:
 def compress_payload(data: bytes) -> tuple[bytes, str]:
     if not data:
         return data, "none"
+    # XZ has a noticeable startup cost and a fixed header/footer overhead.
+    # Tiny Meshtastic payloads almost never benefit from it, so skip them to
+    # avoid delaying the first metadata packet and making the UI feel frozen.
+    if len(data) < 512:
+        return data, "none"
     compressed = lzma.compress(data, format=lzma.FORMAT_XZ, preset=9 | lzma.PRESET_EXTREME)
     if len(compressed) >= len(data):
         return data, "none"

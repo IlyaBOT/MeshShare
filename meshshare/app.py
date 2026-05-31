@@ -497,6 +497,7 @@ class MainMenuScreen(Screen):
         self.toolbar_active = False
         self.toolbar_index = 0
         self.node_ids: dict[str, NodeTarget] = {}
+        self._node_option_counter = 0
         self.transmitting = False
         self.focus_area = "input"
         self.chat_lines: list[ChatLine] = []
@@ -509,7 +510,7 @@ class MainMenuScreen(Screen):
             with Horizontal(id="toolbar"):
                 for index, label in enumerate(self.TOOLBAR):
                     yield Button(label, id=f"tool-{index}", classes="tool-button")
-                yield Static("DISCONNECTED", id="device-status")
+                yield Static("DISCONNECTED", id="device-status", markup=False)
             with Horizontal(id="chat-body"):
                 with Vertical(id="chat-panel"):
                     yield Static("", id="chat-topic")
@@ -535,14 +536,14 @@ class MainMenuScreen(Screen):
         self.query_one("#message-input", Input).focus()
         self._update_recipient_status()
         self._update_channel_view()
-        if self.app.transport is not None:  # type: ignore[attr-defined]
-            asyncio.create_task(self.refresh_nodes(quiet=True))
+        self._maybe_load_initial_nodes()
 
     def on_screen_resume(self) -> None:
         self._set_connected_state()
         self._update_toolbar()
         self._update_recipient_status()
         self._update_channel_view()
+        self._maybe_load_initial_nodes()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
@@ -625,7 +626,7 @@ class MainMenuScreen(Screen):
                 event.stop()
 
     async def action_refresh_nodes(self) -> None:
-        await self.refresh_nodes(quiet=True)
+        await self.refresh_nodes(quiet=True, replace=False)
 
     def action_toggle_focus(self) -> None:
         self._cycle_focus(1)
@@ -682,7 +683,55 @@ class MainMenuScreen(Screen):
         suffix = "Encrypted" if channel.encrypted else "Unencrypted"
         self.write_system(f"#{channel.name} ({suffix})")
 
-    async def refresh_nodes(self, quiet: bool = False) -> None:
+    def _maybe_load_initial_nodes(self) -> None:
+        if self.app.transport is None:  # type: ignore[attr-defined]
+            return
+        if self.app.nodes_loaded or self.app.nodes_loading:  # type: ignore[attr-defined]
+            return
+        self.app.nodes_loading = True  # type: ignore[attr-defined]
+        asyncio.create_task(self._load_initial_nodes(self.app.nodes_generation))  # type: ignore[attr-defined]
+
+    async def _load_initial_nodes(self, generation: int) -> None:
+        try:
+            await self.load_initial_nodes(generation=generation)
+        finally:
+            if self.app.nodes_generation == generation:  # type: ignore[attr-defined]
+                self.app.nodes_loading = False  # type: ignore[attr-defined]
+
+    async def load_initial_nodes(
+        self,
+        attempts: int = 5,
+        delay_seconds: float = 0.8,
+        generation: Optional[int] = None,
+    ) -> None:
+        if generation is None:
+            generation = self.app.nodes_generation  # type: ignore[attr-defined]
+        for attempt in range(attempts):
+            if self.app.transport is None or self.app.nodes_generation != generation:  # type: ignore[attr-defined]
+                return
+            try:
+                nodes = await self.app.load_nodes()  # type: ignore[attr-defined]
+            except Exception as exc:
+                if self.app.transport is not None and not self.app.transport.is_connected():  # type: ignore[attr-defined]
+                    self.app._show_local_device_lost()  # type: ignore[attr-defined]
+                else:
+                    self.app.show_error(f"ERROR! {exc}")  # type: ignore[attr-defined]
+                return
+
+            if self.app.nodes_generation != generation:  # type: ignore[attr-defined]
+                return
+            self.add_nodes(nodes, replace=attempt == 0)
+            if nodes:
+                self.app.nodes_loaded = True  # type: ignore[attr-defined]
+                self._update_recipient_status()
+                return
+            if attempt + 1 < attempts:
+                await asyncio.sleep(delay_seconds)
+
+        self.app.nodes_loaded = True  # type: ignore[attr-defined]
+        self._update_recipient_status()
+
+    async def refresh_nodes(self, quiet: bool = False, replace: bool = False) -> None:
         if self.app.transport is None:  # type: ignore[attr-defined]
             if not quiet:
                 self.write_chat("* not connected")
@@ -696,26 +745,50 @@ class MainMenuScreen(Screen):
                 self.app.show_error(f"ERROR! {exc}")  # type: ignore[attr-defined]
             return
 
+        added = self.add_nodes(nodes, replace=replace)
+        self.app.nodes_loaded = True  # type: ignore[attr-defined]
+        if not nodes and not quiet:
+            self.write_chat("* no nodes heard")
+        elif added and not quiet:
+            self.write_chat(f"* added {added} new node(s)")
+        self._update_recipient_status()
+
+    def add_nodes(self, nodes: list[NodeTarget], replace: bool = False) -> int:
         option_list = self.query_one("#nodes", OptionList)
-        option_list.clear_options()
-        self.node_ids.clear()
-        self.app.nodes_by_key.clear()  # type: ignore[attr-defined]
-        for index, node in enumerate(nodes):
-            option_id = f"node-{index}"
+        if replace:
+            option_list.clear_options()
+            self.node_ids.clear()
+            self.app.nodes_by_key.clear()  # type: ignore[attr-defined]
+            self._node_option_counter = 0
+
+        added = 0
+        if nodes and not self.node_ids:
+            option_list.clear_options()
+
+        for node in nodes:
+            if self._node_known(node):
+                continue
+            option_id = f"node-{self._node_option_counter}"
+            self._node_option_counter += 1
             heard = human_last_heard(node.last_heard)
             signal = _format_node_signal(node)
             option_list.add_option(Option(f"{node.name:<18} {heard:>4} {signal:>18}", id=option_id))
-            self.node_ids[option_id] = node
-            self.app.nodes_by_key[option_id] = node  # type: ignore[attr-defined]
-            self.app.nodes_by_key[node.node_id] = node  # type: ignore[attr-defined]
-            self.app.nodes_by_key[node.destination] = node  # type: ignore[attr-defined]
-            if isinstance(node.destination, int):
-                self.app.nodes_by_key[f"!{node.destination:08x}"] = node  # type: ignore[attr-defined]
-        if not nodes:
+            self._remember_node(option_id, node)
+            added += 1
+
+        option_count = getattr(option_list, "option_count", len(getattr(option_list, "_options", [])))
+        if not self.node_ids and not option_count:
             option_list.add_option(Option("No nodes heard", id="empty", disabled=True))
-            if not quiet:
-                self.write_chat("* no nodes heard")
-        self._update_recipient_status()
+        return added
+
+    def _node_known(self, node: NodeTarget) -> bool:
+        return any(key in self.app.nodes_by_key for key in _node_identity_keys(node))  # type: ignore[attr-defined]
+
+    def _remember_node(self, option_id: str, node: NodeTarget) -> None:
+        self.node_ids[option_id] = node
+        self.app.nodes_by_key[option_id] = node  # type: ignore[attr-defined]
+        for key in _node_identity_keys(node):
+            self.app.nodes_by_key[key] = node  # type: ignore[attr-defined]
 
     async def begin_send(self) -> None:
         if self.app.in_channel_mode:  # type: ignore[attr-defined]
@@ -763,7 +836,10 @@ class MainMenuScreen(Screen):
         self._set_connected_state()
         if self.app.transport is not None:  # type: ignore[attr-defined]
             self.write_chat(f"* connected to {self.app.connected_node_name}")  # type: ignore[attr-defined]
-            asyncio.create_task(self.refresh_nodes(quiet=True))
+            self._maybe_load_initial_nodes()
+
+    def apply_status_only(self) -> None:
+        self._set_connected_state()
 
     def show_receive_waiting(self, offer: IncomingOffer) -> None:
         metadata = offer.metadata
@@ -1077,7 +1153,9 @@ class MainMenuScreen(Screen):
     def clear_nodes(self) -> None:
         self.query_one("#nodes", OptionList).clear_options()
         self.node_ids.clear()
+        self._node_option_counter = 0
         self.app.nodes_by_key.clear()  # type: ignore[attr-defined]
+        self.app.nodes_loaded = False  # type: ignore[attr-defined]
         self._update_recipient_status()
 
     def _update_recipient_status(self) -> None:
@@ -1486,6 +1564,8 @@ class MeshShareApp(App):
         self._fatal_device_lost = False
         self.chat_messages_by_packet_id: dict[int, ChatRecord] = {}
         self.sent_reaction_packet_ids: set[int] = set()
+        self.nodes_loaded = False
+        self.nodes_loading = False
 
     def on_mount(self) -> None:
         self.push_screen(MainMenuScreen())
@@ -1494,6 +1574,12 @@ class MeshShareApp(App):
 
     def show_connection_dialog(self) -> None:
         self.push_screen(ConnectionScreen(self.settings))
+
+    def main_menu_screen(self) -> Optional[MainMenuScreen]:
+        for screen in reversed(self.screen_stack):
+            if isinstance(screen, MainMenuScreen):
+                return screen
+        return None
 
     async def connect_to_node(self, config: ConnectionConfig) -> None:
         transport = MeshtasticTransport()
@@ -1524,14 +1610,19 @@ class MeshShareApp(App):
         self.manager = manager
         self.connection_kind = _connection_label(config.kind)
         self.connected_node_name = local_name or config.name or config.endpoint or config.kind
+        self.nodes_by_key.clear()
+        self.nodes_loaded = False
+        self.nodes_loading = False
+        self._fatal_device_lost = False
         self.selected_node = None
         self.selected_file = None
         self.channel_index = 0
         self.current_channel = None
         self.in_channel_mode = False
         self._remember_successful_connection(config, local_name)
-        if isinstance(self.screen, MainMenuScreen):
-            self.screen.apply_connection_state()
+        screen = self.main_menu_screen()
+        if screen is not None:
+            screen.apply_connection_state()
 
     def _remember_successful_connection(self, config: ConnectionConfig, local_name: str) -> None:
         self.settings.last_kind = config.kind
@@ -1568,9 +1659,10 @@ class MeshShareApp(App):
         except TransferError as exc:
             message = str(exc)
             if message == STOPPED_ERROR:
-                if isinstance(self.screen, MainMenuScreen):
-                    self.screen.set_transmitting(False)
-                    self.screen.write_chat("* transfer stopped")
+                screen = self.main_menu_screen()
+                if screen is not None:
+                    screen.set_transmitting(False)
+                    screen.write_chat("* transfer stopped")
                 else:
                     self.switch_screen(MainMenuScreen())
             elif message == TIMEOUT_ERROR:
@@ -1582,8 +1674,9 @@ class MeshShareApp(App):
         except Exception:
             self._show_local_device_lost()
         finally:
-            if isinstance(self.screen, MainMenuScreen):
-                self.screen.set_transmitting(False)
+            screen = self.main_menu_screen()
+            if screen is not None:
+                screen.set_transmitting(False)
             self.transfer_task = None
 
     def stop_transfer(self) -> None:
@@ -1604,10 +1697,13 @@ class MeshShareApp(App):
         self.current_channel = None
         self.in_channel_mode = False
         self.channel_index = 0
-        if isinstance(self.screen, MainMenuScreen):
-            self.screen.write_chat("* device disconnected")
-            self.screen.clear_nodes()
-            self.screen.apply_connection_state()
+        self.nodes_loaded = False
+        self.nodes_loading = False
+        screen = self.main_menu_screen()
+        if screen is not None:
+            screen.write_chat("* device disconnected")
+            screen.clear_nodes()
+            screen.apply_connection_state()
 
     def device_status_text(self, max_width: int = 46) -> str:
         if self.transport is None:
@@ -1673,7 +1769,27 @@ class MeshShareApp(App):
                 return node
         return None
 
+    def _learn_peer_from_message(self, message) -> None:
+        screen = self.main_menu_screen()
+        if screen is None:
+            return
+        if self.peer_node_for_message(message) is not None:
+            return
+
+        node = None
+        if self.transport is not None:
+            try:
+                node = self.transport.find_node(getattr(message, "from_id", None), getattr(message, "from_node_num", None))
+            except Exception:
+                node = None
+        if node is None:
+            node = _node_target_from_message(message)
+        if node is None:
+            return
+        screen.add_nodes([node], replace=False)
+
     def _handle_mesh_message(self, message) -> None:
+        self.call_from_thread(self._learn_peer_from_message, message)
         try:
             parse_frame(message.text)
         except ProtocolError:
@@ -1693,7 +1809,8 @@ class MeshShareApp(App):
             ).start()
 
     def _append_incoming_chat(self, message) -> None:
-        if isinstance(self.screen, MainMenuScreen):
+        screen = self.main_menu_screen()
+        if screen is not None:
             sender = self.peer_display_name(message)
             node = self.peer_node_for_message(message)
             if message.emoji and message.reply_id is not None:
@@ -1702,9 +1819,9 @@ class MeshShareApp(App):
                     return
                 referenced = self.chat_messages_by_packet_id.get(message.reply_id)
                 if referenced is not None:
-                    self.screen.add_reaction_to_record(referenced, message.emoji)
+                    screen.add_reaction_to_record(referenced, message.emoji)
                 else:
-                    self.screen.write_system(
+                    screen.write_system(
                         f"* reaction {message.emoji} from {sender} to unknown message",
                         timestamp=message.timestamp,
                     )
@@ -1716,7 +1833,7 @@ class MeshShareApp(App):
                 else None
             )
             if referenced is not None:
-                self.screen.write_reply_quote(
+                screen.write_reply_quote(
                     referenced.sender,
                     referenced.text,
                     timestamp=message.timestamp,
@@ -1729,23 +1846,25 @@ class MeshShareApp(App):
                 node=node,
                 timestamp=message.timestamp,
             )
-            self.screen.write_peer_message(sender, message.text, timestamp=message.timestamp, record=record)
+            screen.write_peer_message(sender, message.text, timestamp=message.timestamp, record=record)
 
     def _incoming_offer_from_worker(self, offer: IncomingOffer) -> bool:
         event = threading.Event()
         result = {"accepted": False}
 
         def ask_user() -> None:
-            if not isinstance(self.screen, MainMenuScreen):
+            screen = self.main_menu_screen()
+            if screen is None:
                 event.set()
                 return
 
             def done(accepted: bool) -> None:
                 result["accepted"] = accepted
-                if accepted and isinstance(self.screen, MainMenuScreen):
-                    self.screen.show_receive_waiting(offer)
-                elif isinstance(self.screen, MainMenuScreen):
-                    self.screen.clear_receive_waiting()
+                current_screen = self.main_menu_screen()
+                if accepted and current_screen is not None:
+                    current_screen.show_receive_waiting(offer)
+                elif current_screen is not None:
+                    current_screen.clear_receive_waiting()
                 event.set()
 
             self.push_screen(ReceiveOfferScreen(offer, timeout_seconds=60), callback=done)
@@ -1762,10 +1881,11 @@ class MeshShareApp(App):
         if snapshot.state == "error" and snapshot.message == TIMEOUT_ERROR:
             self.show_error("Signal Lost!", callback=lambda: self.switch_screen(MainMenuScreen()))
             return
-        if snapshot.direction == "send" and isinstance(self.screen, MainMenuScreen):
-            self.screen.apply_send_snapshot(snapshot)
-        elif snapshot.direction == "receive" and isinstance(self.screen, MainMenuScreen):
-            self.screen.apply_receive_snapshot(snapshot)
+        screen = self.main_menu_screen()
+        if snapshot.direction == "send" and screen is not None:
+            screen.apply_send_snapshot(snapshot)
+        elif snapshot.direction == "receive" and screen is not None:
+            screen.apply_receive_snapshot(snapshot)
             if snapshot.state == "complete" and snapshot.output_path:
                 asyncio.create_task(self._save_received_file(snapshot))
 
@@ -1773,8 +1893,9 @@ class MeshShareApp(App):
         source = Path(snapshot.output_path)
         destination = await asyncio.to_thread(save_file_dialog, snapshot.file_name)
         if destination is None:
-            if isinstance(self.screen, MainMenuScreen):
-                self.screen.write_chat(f"* received file left in temp: {source}")
+            screen = self.main_menu_screen()
+            if screen is not None:
+                screen.write_chat(f"* received file left in temp: {source}")
             return
         try:
             await asyncio.to_thread(shutil.copy2, source, destination)
@@ -1785,14 +1906,19 @@ class MeshShareApp(App):
             source.unlink()
         except OSError:
             pass
-        if isinstance(self.screen, MainMenuScreen):
-            self.screen.write_chat(f"* saved received file: {destination}")
+        screen = self.main_menu_screen()
+        if screen is not None:
+            screen.write_chat(f"* saved received file: {destination}")
 
     def _check_local_device(self) -> None:
         if self.transport is None or self._fatal_device_lost:
             return
         if not self.transport.is_connected():
             self._show_local_device_lost()
+            return
+        screen = self.main_menu_screen()
+        if screen is not None:
+            screen.apply_status_only()
 
     def _show_local_device_lost(self) -> None:
         if self._fatal_device_lost:
@@ -1807,11 +1933,14 @@ class MeshShareApp(App):
     def show_retry_transfer_error(self, file_path: Path, target: NodeTarget, channel_index: int) -> None:
         def done(retry: bool) -> None:
             if retry:
-                if isinstance(self.screen, MainMenuScreen):
-                    self.screen.set_transmitting(True)
+                screen = self.main_menu_screen()
+                if screen is not None:
+                    screen.set_transmitting(True)
                 self.transfer_task = asyncio.create_task(self.send_file(file_path, target, channel_index))
-            elif isinstance(self.screen, MainMenuScreen):
-                self.screen.set_transmitting(False)
+            else:
+                screen = self.main_menu_screen()
+                if screen is not None:
+                    screen.set_transmitting(False)
 
         self.push_screen(RetryTransferScreen(SYNC_ERROR), callback=done)
 
@@ -1848,6 +1977,35 @@ def _message_sender_keys(message) -> set[object]:
         if isinstance(value, int):
             keys.add(f"!{value:08x}")
     return keys
+
+
+def _node_identity_keys(node: NodeTarget) -> set[object]:
+    keys: set[object] = {node.node_id, str(node.node_id), node.destination, str(node.destination)}
+    keys.add(str(node.node_id).lower())
+    keys.add(str(node.destination).lower())
+    if isinstance(node.destination, int):
+        keys.add(f"!{node.destination:08x}")
+    return {key for key in keys if key not in {None, "", "None"}}
+
+
+def _node_target_from_message(message) -> Optional[NodeTarget]:
+    from_id = getattr(message, "from_id", None)
+    from_node_num = getattr(message, "from_node_num", None)
+    destination = from_id if from_id is not None else from_node_num
+    if destination is None:
+        return None
+    if isinstance(from_id, str) and from_id:
+        node_id = from_id
+    elif isinstance(from_node_num, int):
+        node_id = f"!{from_node_num:08x}"
+    else:
+        node_id = str(destination)
+    return NodeTarget(
+        destination=destination,
+        node_id=node_id,
+        name=node_id,
+        snr=getattr(message, "rx_snr", None),
+    )
 
 
 def _format_node_signal(node: NodeTarget) -> str:
