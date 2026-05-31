@@ -32,6 +32,13 @@ class BluetoothDevice:
 
 
 @dataclass(frozen=True)
+class ChannelInfo:
+    index: int
+    name: str
+    encrypted: bool
+
+
+@dataclass(frozen=True)
 class NodeTarget:
     destination: Destination
     node_id: str
@@ -46,6 +53,7 @@ class LocalNodeStatus:
     name: str = ""
     battery_level: Optional[int] = None
     voltage: Optional[float] = None
+    powered: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,6 +70,9 @@ class MeshMessage:
     rx_snr: Optional[float]
     packet_id: Optional[int]
     channel_index: int = 0
+    timestamp: Optional[float] = None
+    reply_id: Optional[int] = None
+    emoji: str = ""
 
 
 class MeshtasticTransport:
@@ -130,17 +141,40 @@ class MeshtasticTransport:
         destination_id: Destination,
         channel_index: int = 0,
         want_ack: bool = True,
-    ) -> None:
+        reply_id: Optional[int] = None,
+    ) -> Optional[int]:
         if frame_len(text) > MAX_FRAME_BYTES:
             raise ProtocolError("attempted to send a frame larger than 200 bytes")
         with self._lock:
             if self.interface is None:
                 raise RuntimeError("not connected to a Meshtastic node")
-            self.interface.sendText(
+            packet = self.interface.sendText(
                 text,
                 destinationId=destination_id,
                 wantAck=want_ack,
                 channelIndex=channel_index,
+                replyId=reply_id,
+            )
+            return _packet_id(packet)
+
+    def send_reaction(
+        self,
+        emoji: str,
+        reply_id: int,
+        destination_id: Destination,
+        channel_index: int = 0,
+    ) -> Optional[int]:
+        if not emoji:
+            raise ProtocolError("empty emoji reaction")
+        with self._lock:
+            if self.interface is None:
+                raise RuntimeError("not connected to a Meshtastic node")
+            return _send_text_reaction(
+                self.interface,
+                emoji,
+                reply_id,
+                destination_id,
+                channel_index,
             )
 
     def send_traceroute(
@@ -197,6 +231,20 @@ class MeshtasticTransport:
                 ),
             )
 
+    def list_channels(self) -> list[ChannelInfo]:
+        with self._lock:
+            interface = self.interface
+            if interface is None:
+                return []
+            channels = []
+            local_node = getattr(interface, "localNode", None)
+            raw_channels = getattr(local_node, "channels", None) or []
+            for channel in raw_channels:
+                info = _channel_info_from_channel(channel)
+                if info is not None:
+                    channels.append(info)
+            return sorted(channels, key=lambda channel: channel.index)
+
     def get_signal(self, destination: Destination) -> Optional[float]:
         with self._lock:
             interface = self.interface
@@ -236,10 +284,12 @@ class MeshtasticTransport:
                 metrics = node.get("deviceMetrics") or node.get("metrics") or {}
             battery = metrics.get("batteryLevel") if isinstance(metrics, dict) else None
             voltage = metrics.get("voltage") if isinstance(metrics, dict) else None
+            battery_level = _as_int_optional(battery)
             return LocalNodeStatus(
                 name=name,
-                battery_level=_as_int_optional(battery),
+                battery_level=battery_level,
                 voltage=_as_float(voltage),
+                powered=battery_level is not None and battery_level > 100,
             )
 
     def _get_local_node_dict(self) -> Optional[dict]:
@@ -287,6 +337,10 @@ class MeshtasticTransport:
             payload = decoded.get("payload")
             if isinstance(payload, bytes):
                 text = payload.decode("utf-8", "replace")
+        emoji = _decoded_str(decoded, "emoji")
+        reply_id = _decoded_int(decoded, "replyId", "reply_id")
+        if text is None and emoji and reply_id is not None:
+            text = ""
         if not isinstance(text, str):
             return
 
@@ -299,8 +353,11 @@ class MeshtasticTransport:
             from_id=from_id,
             from_node_num=from_node_num if isinstance(from_node_num, int) else None,
             rx_snr=_as_float(packet.get("rxSnr")) if isinstance(packet, dict) else None,
-            packet_id=packet.get("id") if isinstance(packet, dict) else None,
+            packet_id=_as_int_optional(packet.get("id")) if isinstance(packet, dict) else None,
             channel_index=_as_int(packet.get("channel")) if isinstance(packet, dict) else 0,
+            timestamp=_packet_timestamp(packet) if isinstance(packet, dict) else None,
+            reply_id=reply_id,
+            emoji=emoji,
         )
         if self.on_message is not None:
             self.on_message(message)
@@ -361,6 +418,40 @@ def test_tcp_connection(endpoint: str, use_https: bool, timeout: float = 5.0) ->
         return True, (time.perf_counter() - started) * 1000
     except OSError:
         return False, None
+
+
+def _send_text_reaction(
+    interface,
+    emoji: str,
+    reply_id: int,
+    destination_id: Destination,
+    channel_index: int,
+) -> Optional[int]:
+    from meshtastic import mesh_pb2, portnums_pb2
+
+    packet = mesh_pb2.MeshPacket()
+    packet.channel = channel_index
+    packet.decoded.portnum = portnums_pb2.PortNum.TEXT_MESSAGE_APP
+    packet.decoded.payload = b""
+    packet.decoded.reply_id = reply_id
+    packet.decoded.emoji = ord(emoji[0])
+    packet.id = interface._generatePacketId()
+    sent = interface._sendPacket(packet, destination_id, wantAck=False)
+    return _packet_id(sent)
+
+
+def _channel_info_from_channel(channel) -> Optional[ChannelInfo]:
+    index = _as_int_optional(getattr(channel, "index", None))
+    settings = getattr(channel, "settings", None)
+    role = str(getattr(channel, "role", "") or "")
+    if index is None or settings is None:
+        return None
+    if role.endswith("DISABLED") or role == "0":
+        return None
+    name = str(getattr(settings, "name", "") or ("Primary" if index == 0 else f"Channel {index}"))
+    psk = bytes(getattr(settings, "psk", b"") or b"")
+    encrypted = bool(psk and psk != b"\x01")
+    return ChannelInfo(index=index, name=name, encrypted=encrypted)
 
 
 def _send_traceroute_with_result(
@@ -622,6 +713,40 @@ def _as_int_optional(value) -> Optional[int]:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _packet_id(packet) -> Optional[int]:
+    if isinstance(packet, dict):
+        return _as_int_optional(packet.get("id"))
+    return _as_int_optional(getattr(packet, "id", None))
+
+
+def _packet_timestamp(packet: dict) -> Optional[float]:
+    for key in ("rxTime", "rx_time"):
+        timestamp = _as_float(packet.get(key))
+        if timestamp is not None:
+            return timestamp
+    return None
+
+
+def _decoded_int(decoded: dict, *keys: str) -> Optional[int]:
+    for key in keys:
+        value = _as_int_optional(decoded.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _decoded_str(decoded: dict, key: str) -> str:
+    value = decoded.get(key)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, int) and value > 0:
+        try:
+            return chr(value)
+        except ValueError:
+            return ""
+    return ""
 
 
 def _open_serial_interface(serial_interface_module, dev_path: Optional[str], baudrate: int):

@@ -6,13 +6,20 @@ from meshshare.protocol import (
     TransferMetadata,
     decode_data_payload,
     decode_metadata,
+    compress_payload,
+    decompress_payload,
     encode_accept_frame,
     encode_data_frame,
     encode_decline_frame,
     encode_metadata_frames,
     encode_resend_frames,
+    encode_sync_request_frame,
+    encode_sync_state_frame,
     encode_stop_frame,
+    frame_header,
     frame_len,
+    is_protocol_like,
+    make_metadata,
     parse_frame,
     parse_range_spec,
     sha256_b64,
@@ -21,6 +28,32 @@ from meshshare.protocol import (
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_compact_headers_match_protocol_bit_layout(self):
+        expected = {
+            "M": "44",
+            "D": "74",
+            "Y": "4c",
+            "N": "70",
+            "S": "40",
+            "A": "48",
+            "R": "50",
+            "C": "60",
+            "E": "7c",
+            "Q": "54",
+            "Z": "58",
+        }
+
+        for kind, header in expected.items():
+            self.assertEqual(frame_header(kind), header)
+            self.assertTrue(is_protocol_like(f"{header}|abc123"))
+
+    def test_parser_accepts_legacy_and_compact_headers(self):
+        self.assertEqual(parse_frame("MS1|D|abc123|0|3610a686|aGVsbG8").kind, "D")
+        compact = encode_data_frame("abc123", 0, b"hello")
+
+        self.assertTrue(compact.startswith("74|"))
+        self.assertEqual(parse_frame(compact).kind, "D")
+
     def test_data_frames_fit_under_200_bytes_and_roundtrip(self):
         data = bytes(range(256)) * 3
         session_id = "abc123"
@@ -43,6 +76,8 @@ class ProtocolTests(unittest.TestCase):
             total=103,
             chunk=120,
             sha256=sha256_b64(b"payload"),
+            original_size=12345,
+            original_sha256=sha256_b64(b"payload"),
         )
         frames = [parse_frame(text) for text in encode_metadata_frames("fff001", metadata)]
         for text_frame in encode_metadata_frames("fff001", metadata):
@@ -83,6 +118,33 @@ class ProtocolTests(unittest.TestCase):
         for text, kind in zip(frames, kinds):
             self.assertLessEqual(frame_len(text), MAX_FRAME_BYTES)
             self.assertEqual(parse_frame(text).kind, kind)
+
+    def test_compressed_payload_roundtrip(self):
+        original = (b"mesh text " * 200)
+        payload, compression = compress_payload(original)
+        metadata = make_metadata(
+            Path("text.txt"),
+            payload,
+            120,
+            original_data=original,
+            compression=compression,
+        )
+
+        self.assertEqual(compression, "xz")
+        self.assertLess(len(payload), len(original))
+        self.assertEqual(decompress_payload(payload, metadata), original)
+
+    def test_sync_frames_roundtrip_and_fit(self):
+        request = parse_frame(encode_sync_request_frame("abc123", 128, 512, "ff00aa"))
+        response = parse_frame(
+            encode_sync_state_frame("abc123", 125, 3, 127, [3, 5, 6, 12], "ff00aa")
+        )
+
+        self.assertLessEqual(frame_len(encode_sync_request_frame("abc123", 128, 512, "ff00aa")), MAX_FRAME_BYTES)
+        self.assertEqual(request.kind, "Q")
+        self.assertEqual(request.sent, 128)
+        self.assertEqual(response.kind, "Z")
+        self.assertEqual(response.missing, (3, 5, 6, 12))
 
 
 if __name__ == "__main__":

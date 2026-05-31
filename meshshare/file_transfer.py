@@ -21,10 +21,14 @@ from .protocol import (
     ProtocolError,
     ResendFrame,
     StopFrame,
+    SyncRequestFrame,
+    SyncStateFrame,
     TransferMetadata,
+    compress_payload,
     encode_accept_frame,
     decode_data_payload,
     decode_metadata,
+    decompress_payload,
     encode_ack_frame,
     encode_complete_frame,
     encode_data_frame,
@@ -32,9 +36,12 @@ from .protocol import (
     encode_error_frame,
     encode_metadata_frames,
     encode_resend_frames,
+    encode_sync_request_frame,
+    encode_sync_state_frame,
     encode_stop_frame,
     make_metadata,
     make_session_id,
+    metadata_original_size,
     parse_frame,
     safe_filename,
     sha256_b64,
@@ -46,6 +53,7 @@ from .transport import Destination, MeshMessage, MeshtasticTransport, NodeTarget
 LOW_SIGNAL_ERROR = "ERROR! Too low radio signal!"
 TIMEOUT_ERROR = "ERROR! Signal Lost!"
 STOPPED_ERROR = "ERROR! Transfer stopped."
+SYNC_ERROR = "ERROR! Sync failed. Retry transfer or cancel."
 MAX_RECEIVE_BYTES = 5 * 1024 * 1024
 
 
@@ -110,6 +118,7 @@ class OutgoingSession:
     stop_event: threading.Event = field(default_factory=threading.Event)
     error: Optional[str] = None
     resend_queue: "queue.Queue[tuple[int, ...]]" = field(default_factory=queue.Queue)
+    sync_queue: "queue.Queue[SyncStateFrame]" = field(default_factory=queue.Queue)
 
 
 @dataclass
@@ -142,11 +151,13 @@ class FileTransferManager:
         chunk_bytes: int = DEFAULT_RAW_CHUNK_BYTES,
         max_receive_bytes: int = MAX_RECEIVE_BYTES,
         min_snr: float = -20.0,
-        packet_delay: float = 1.1,
+        packet_delay: float = 1.0,
         ack_every: int = 4,
         resend_after: float = 8.0,
         complete_timeout: float = 90.0,
         offer_timeout: Optional[float] = None,
+        sync_timeout: float = 5.0,
+        sync_retries: int = 3,
     ) -> None:
         self.transport = transport
         self.download_dir = download_dir
@@ -160,11 +171,14 @@ class FileTransferManager:
         self.resend_after = resend_after
         self.complete_timeout = complete_timeout
         self.offer_timeout = complete_timeout if offer_timeout is None else offer_timeout
+        self.sync_timeout = sync_timeout
+        self.sync_retries = sync_retries
         self._lock = threading.RLock()
         self._outgoing: dict[str, OutgoingSession] = {}
         self._incoming: dict[str, IncomingSession] = {}
         self._blocked_sessions: set[str] = set()
         self._stop = threading.Event()
+        self._cancel_pending_send = threading.Event()
         self._monitor_thread = threading.Thread(
             target=self._monitor_missing_chunks,
             name="MeshShareMissingMonitor",
@@ -178,11 +192,18 @@ class FileTransferManager:
 
     def send_file(self, path: Path, target: NodeTarget, channel_index: int = 0) -> None:
         path = Path(path)
-        data = path.read_bytes()
+        original_data = path.read_bytes()
+        data, compression = compress_payload(original_data)
         session_id = make_session_id()
         chunks = split_chunks(data, self.chunk_bytes)
         validate_chunk_size(session_id, len(chunks), self.chunk_bytes, max_bytes=MAX_FRAME_BYTES)
-        metadata = make_metadata(path, data, self.chunk_bytes)
+        metadata = make_metadata(
+            path,
+            data,
+            self.chunk_bytes,
+            original_data=original_data,
+            compression=compression,
+        )
 
         signal = self.transport.get_signal(target.destination)
         if signal is None:
@@ -195,7 +216,7 @@ class FileTransferManager:
                     session_id=session_id,
                     file_name=path.name,
                     node_name=target.name,
-                    file_size=len(data),
+                    file_size=len(original_data),
                     total_chunks=len(chunks),
                     signal_db=signal,
                     message=LOW_SIGNAL_ERROR,
@@ -215,19 +236,25 @@ class FileTransferManager:
         )
         with self._lock:
             self._outgoing[session_id] = outgoing
+            if self._cancel_pending_send.is_set():
+                self._cancel_pending_send.clear()
+                outgoing.stop_event.set()
 
         try:
             self._emit_outgoing(outgoing, "offering", "Sending transfer request")
             for frame in encode_metadata_frames(session_id, metadata):
                 self._raise_if_stopped(outgoing)
                 self._send_frame(outgoing, frame)
-                time.sleep(self.packet_delay)
+                self._sleep_or_stop(outgoing, self.packet_delay)
 
             self._wait_for_accept(outgoing)
 
+            sync_interval = sync_interval_for(len(chunks))
             for index in range(len(chunks)):
                 self._raise_if_stopped(outgoing)
                 self._send_chunk(outgoing, index)
+                if index + 1 < len(chunks) and (index + 1) % sync_interval == 0:
+                    self._sync_outgoing(outgoing, index + 1)
 
             deadline = time.monotonic() + self.complete_timeout
             while not outgoing.complete_event.is_set():
@@ -254,6 +281,15 @@ class FileTransferManager:
                 "complete",
                 f'File "{path.name}" successfully sended to node "{target.name}"!',
             )
+        except TransferError as exc:
+            message = str(exc)
+            if message == STOPPED_ERROR:
+                self._emit_outgoing(outgoing, "stopped", STOPPED_ERROR)
+                raise
+            if not message.startswith("ERROR!"):
+                message = f"ERROR! {message}"
+            self._emit_outgoing(outgoing, "error", message)
+            raise
         except Exception as exc:
             message = str(exc)
             if not message.startswith("ERROR!"):
@@ -271,21 +307,33 @@ class FileTransferManager:
             return
 
         with self._lock:
-            if frame.kind in {"A", "R", "C", "E", "Y", "N", "S"}:
+            if frame.kind in {"A", "R", "C", "E", "Y", "N", "S", "Z"}:
                 self._handle_sender_control(frame, message)
             elif frame.kind == "M":
                 self._handle_metadata(frame, message)
             elif frame.kind == "D":
                 self._handle_data(frame, message)
+            elif frame.kind == "Q":
+                self._handle_sync_request(frame, message)
 
     def _handle_sender_control(
         self,
-        frame: AckFrame | ResendFrame | AcceptFrame | DeclineFrame | StopFrame | CompleteFrame | ErrorFrame,
+        frame: AckFrame
+        | ResendFrame
+        | AcceptFrame
+        | DeclineFrame
+        | StopFrame
+        | CompleteFrame
+        | ErrorFrame
+        | SyncStateFrame,
         message: MeshMessage,
     ) -> None:
         outgoing = self._outgoing.get(frame.session_id)
         if outgoing is None and frame.kind == "S":
             self._handle_incoming_stop(frame, message)
+            return
+        if outgoing is None and frame.kind == "C":
+            self._handle_incoming_complete(frame, message)
             return
         if outgoing is None:
             return
@@ -318,6 +366,8 @@ class FileTransferManager:
                 outgoing.error = "ERROR! Receiver reported wrong SHA-256."
         elif frame.kind == "E":
             outgoing.error = f"ERROR! {frame.message}"
+        elif frame.kind == "Z":
+            outgoing.sync_queue.put(frame)
 
     def _handle_metadata(self, frame: MetaFrame, message: MeshMessage) -> None:
         if message.from_id is None:
@@ -402,7 +452,7 @@ class FileTransferManager:
         self._emit_incoming(session, "receiving", "Incoming file accepted")
 
     def _validate_incoming_metadata(self, metadata: TransferMetadata) -> None:
-        if metadata.size > self.max_receive_bytes:
+        if metadata.size > self.max_receive_bytes or metadata_original_size(metadata) > self.max_receive_bytes:
             raise ProtocolError("file is too large")
         validate_chunk_size("ffffff", metadata.total, metadata.chunk, max_bytes=MAX_FRAME_BYTES)
 
@@ -440,10 +490,16 @@ class FileTransferManager:
             self._request_resend(session, self._missing_indices(session))
             self._emit_incoming(session, "receiving", "Final hash mismatch, requesting retransmit")
             return
+        try:
+            output_data = decompress_payload(data, session.metadata)
+        except ProtocolError as exc:
+            self._send_error(session, "DECOMP", str(exc))
+            self._emit_incoming(session, "error", f"ERROR! {exc}")
+            return
 
         self.download_dir.mkdir(parents=True, exist_ok=True)
         output_path = unique_path(self.download_dir / safe_filename(session.metadata.name))
-        output_path.write_bytes(data)
+        output_path.write_bytes(output_data)
         session.completed = True
         self._send_to_session(session, encode_complete_frame(session.session_id, session.metadata.sha256))
         self._cleanup_session_chunks(session)
@@ -494,6 +550,9 @@ class FileTransferManager:
     def stop_active_transfer(self) -> None:
         with self._lock:
             outgoing_sessions = list(self._outgoing.values())
+            if not outgoing_sessions:
+                self._cancel_pending_send.set()
+                return
         for outgoing in outgoing_sessions:
             outgoing.stop_event.set()
             try:
@@ -538,7 +597,98 @@ class FileTransferManager:
         outgoing.sent_chunks = min(outgoing.metadata.total, outgoing.sent_chunks + (0 if resend else 1))
         outgoing.chunk_send_times.append(time.monotonic() - started)
         self._emit_outgoing(outgoing, "sending", "Retransmitting chunk" if resend else "Sending chunks")
-        time.sleep(self.packet_delay * signal_factor(outgoing.signal_db))
+        self._sleep_or_stop(outgoing, self.packet_delay * signal_factor(outgoing.signal_db))
+
+    def _sync_outgoing(self, outgoing: OutgoingSession, sent_until: int) -> None:
+        nonce = make_session_id()
+        for attempt in range(1, self.sync_retries + 1):
+            self._raise_if_stopped(outgoing)
+            while True:
+                try:
+                    outgoing.sync_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self._send_frame(
+                outgoing,
+                encode_sync_request_frame(
+                    outgoing.session_id,
+                    sent_until,
+                    outgoing.metadata.total,
+                    nonce,
+                ),
+            )
+            started = time.monotonic()
+            self._emit_outgoing(
+                outgoing,
+                "syncing",
+                f"Syncing nodes ({attempt}/{self.sync_retries})",
+            )
+            while time.monotonic() - started < self.sync_timeout:
+                self._raise_if_stopped(outgoing)
+                if outgoing.error:
+                    raise TransferError(outgoing.error)
+                try:
+                    response = outgoing.sync_queue.get(timeout=0.2)
+                except queue.Empty:
+                    continue
+                if response.nonce != nonce:
+                    continue
+                outgoing.verified_chunks = max(outgoing.verified_chunks, response.received)
+                ping_ms = int((time.monotonic() - started) * 1000)
+                if response.missing:
+                    original_sent = outgoing.sent_chunks
+                    outgoing.sent_chunks = min(outgoing.sent_chunks, response.first_missing + 1)
+                    self._emit_outgoing(
+                        outgoing,
+                        "syncing",
+                        f"Sync response: ping {ping_ms}ms, retransmitting missing chunks",
+                    )
+                    for index in response.missing:
+                        if 0 <= index < sent_until and index < outgoing.metadata.total:
+                            self._send_chunk(outgoing, index, resend=True)
+                    outgoing.sent_chunks = max(original_sent, sent_until)
+                else:
+                    self._emit_outgoing(
+                        outgoing,
+                        "syncing",
+                        f"Sync response: ping {ping_ms}ms, receiver has {response.received} chunks",
+                    )
+                return
+        raise TransferError(SYNC_ERROR)
+
+    def _handle_sync_request(self, frame: SyncRequestFrame, message: MeshMessage) -> None:
+        if message.from_id is None:
+            return
+        session = self._incoming.get(frame.session_id)
+        if session is None:
+            return
+        if not _same_sender(session.sender, message.from_id):
+            return
+        if session.metadata is None or not session.accepted or session.completed:
+            return
+        session.channel_index = message.channel_index
+        session.packets_received += 1
+        session.signal_db = message.rx_snr or session.signal_db
+        session.last_packet_at = time.monotonic()
+        sent = min(frame.sent, session.metadata.total)
+        expected = set(range(sent))
+        received_indexes = set(session.chunks)
+        missing = sorted(expected - received_indexes)
+        received = len(received_indexes.intersection(expected))
+        first_missing = missing[0] if missing else sent
+        last_received = max((index for index in received_indexes if index < sent), default=0)
+        self._send_to_session(
+            session,
+            encode_sync_state_frame(
+                session.session_id,
+                received,
+                first_missing,
+                last_received,
+                missing,
+                frame.nonce,
+            ),
+        )
+        self._emit_incoming(session, "receiving", "Synced receiver state")
 
     def _wait_for_accept(self, outgoing: OutgoingSession) -> None:
         deadline = time.monotonic() + self.offer_timeout
@@ -549,10 +699,14 @@ class FileTransferManager:
                 raise TransferError(outgoing.error)
             if time.monotonic() > deadline:
                 raise TransferError(TIMEOUT_ERROR)
-            time.sleep(0.2)
+            self._sleep_or_stop(outgoing, 0.2)
 
     def _raise_if_stopped(self, outgoing: OutgoingSession) -> None:
         if outgoing.stop_event.is_set():
+            raise TransferError(STOPPED_ERROR)
+
+    def _sleep_or_stop(self, outgoing: OutgoingSession, seconds: float) -> None:
+        if outgoing.stop_event.wait(max(0.0, seconds)):
             raise TransferError(STOPPED_ERROR)
 
     def _send_frame(self, outgoing: OutgoingSession, frame: str) -> None:
@@ -572,6 +726,39 @@ class FileTransferManager:
             want_ack=False,
         )
         outgoing.packets_sent += 1
+
+    def _handle_incoming_complete(self, frame: CompleteFrame, message: MeshMessage) -> None:
+        if message.from_id is None:
+            return
+        session = self._incoming.get(frame.session_id)
+        if session is None:
+            return
+        if not _same_sender(session.sender, message.from_id):
+            return
+        session.channel_index = message.channel_index
+        session.packets_received += 1
+        session.signal_db = message.rx_snr or session.signal_db
+        session.last_packet_at = time.monotonic()
+        if session.metadata is None or not session.accepted or session.completed:
+            return
+        if frame.sha256 != session.metadata.sha256:
+            self._send_error(session, "SHA", "complete frame SHA-256 does not match metadata")
+            self._emit_incoming(session, "error", "ERROR! Sender reported wrong SHA-256.")
+            return
+
+        missing = self._missing_indices(session)
+        if missing:
+            # Zero-byte files can be represented by metadata + complete without a data frame.
+            if session.metadata.size == 0 and session.metadata.total == 1 and missing == [0]:
+                chunk_path = self._chunk_path(session, 0)
+                chunk_path.write_bytes(b"")
+                session.chunks[0] = chunk_path
+            else:
+                self._request_resend(session, missing)
+                self._emit_incoming(session, "receiving", "Completion received, waiting for missing chunks")
+                return
+
+        self._finish_incoming(session)
 
     def _handle_incoming_stop(self, frame: StopFrame, message: MeshMessage) -> None:
         session = self._incoming.get(frame.session_id)
@@ -598,7 +785,7 @@ class FileTransferManager:
                 session_id=outgoing.session_id,
                 file_name=outgoing.path.name,
                 node_name=outgoing.target.name,
-                file_size=outgoing.metadata.size,
+                file_size=metadata_original_size(outgoing.metadata),
                 total_chunks=outgoing.metadata.total,
                 verified_chunks=outgoing.verified_chunks,
                 sent_chunks=outgoing.sent_chunks,
@@ -630,7 +817,7 @@ class FileTransferManager:
                 session_id=session.session_id,
                 file_name=metadata.name if metadata else "",
                 node_name=str(session.sender),
-                file_size=metadata.size if metadata else 0,
+                file_size=metadata_original_size(metadata) if metadata else 0,
                 total_chunks=total,
                 verified_chunks=received,
                 received_chunks=received,
@@ -659,6 +846,12 @@ def signal_factor(snr: Optional[float]) -> float:
     if snr < -2:
         return 1.3
     return 1.0
+
+
+def sync_interval_for(total_chunks: int) -> int:
+    if total_chunks <= 4:
+        return max(1, total_chunks)
+    return max(1, (total_chunks + 3) // 4)
 
 
 def estimate_eta(
@@ -693,15 +886,35 @@ def unique_path(path: Path) -> Path:
 def _same_sender(left: Destination, right: Optional[Destination]) -> bool:
     if right is None:
         return False
-    return str(left) == str(right)
+    return bool(_destination_keys(left).intersection(_destination_keys(right)))
 
 
 def _message_matches_target(message: MeshMessage, target: NodeTarget) -> bool:
-    expected = {str(target.destination), str(target.node_id)}
+    expected = _destination_keys(target.destination).union(_destination_keys(target.node_id))
     if message.from_id is not None:
-        if str(message.from_id) in expected:
+        if _destination_keys(message.from_id).intersection(expected):
             return True
     if message.from_node_num is not None:
-        if str(message.from_node_num) in expected or f"!{message.from_node_num:08x}" in expected:
+        if _destination_keys(message.from_node_num).intersection(expected):
             return True
     return False
+
+
+def _destination_keys(value: Destination) -> set[str]:
+    keys = {str(value), str(value).lower()}
+    if isinstance(value, int):
+        keys.add(f"!{value:08x}")
+        keys.add(str(value))
+    elif isinstance(value, str):
+        text = value.strip().lower()
+        if text.startswith("!") and len(text) >= 9:
+            try:
+                keys.add(str(int(text[-8:], 16)))
+            except ValueError:
+                pass
+        elif len(text) >= 8:
+            try:
+                keys.add(f"!{int(text[-8:], 16):08x}")
+            except ValueError:
+                pass
+    return keys

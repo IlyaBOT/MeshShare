@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+import unicodedata
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -28,15 +31,17 @@ from .file_transfer import (
     IncomingOffer,
     FileTransferManager,
     STOPPED_ERROR,
+    SYNC_ERROR,
     TIMEOUT_ERROR,
     TransferError,
     TransferSnapshot,
 )
 from .settings import SavedSettings
-from .protocol import ProtocolError, frame_len, parse_frame
+from .protocol import ProtocolError, frame_len, is_protocol_like, parse_frame
 from .transport import (
     SERIAL_SPEEDS,
     BluetoothDevice,
+    ChannelInfo,
     ConnectionConfig,
     MeshtasticTransport,
     NodeTarget,
@@ -46,6 +51,25 @@ from .transport import (
     serial_port_options,
     test_tcp_connection,
 )
+
+
+@dataclass(frozen=True)
+class ChatRecord:
+    sender: str
+    text: str
+    own: bool
+    packet_id: Optional[int] = None
+    node: Optional[NodeTarget] = None
+    timestamp: Optional[float] = None
+    reactions: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ChatLine:
+    style: str
+    text: str
+    timestamp: Optional[float] = None
+    record: Optional[ChatRecord] = None
 
 
 class ConfirmSendScreen(ModalScreen[str]):
@@ -111,6 +135,154 @@ class ErrorScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class RetryTransferScreen(ModalScreen[bool]):
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self.message = message
+
+    def compose(self) -> ComposeResult:
+        with Container(id="error-dialog"):
+            yield Static("ERROR!", id="error-title")
+            yield Static(self.message, id="error-text")
+            with Horizontal(classes="dialog-buttons"):
+                yield Button("Retry transfer", id="retry", variant="primary")
+                yield Button("Cancel", id="cancel", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "retry")
+
+
+class ChannelSelectScreen(ModalScreen[Optional[ChannelInfo]]):
+    def __init__(self, channels: list[ChannelInfo]) -> None:
+        super().__init__()
+        self.channels = channels
+        self.by_id = {f"channel-{channel.index}": channel for channel in channels}
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dialog"):
+            yield Static("Channels", id="dialog-text")
+            options = self._channel_options()
+            yield Select(options, value=options[0][1], id="channel-select")
+            with Horizontal(classes="dialog-buttons channel-dialog-buttons"):
+                yield Button("Connect", id="connect", variant="primary", classes="channel-connect-button")
+                yield Button("Cancel", id="cancel", variant="error", classes="channel-cancel-button")
+
+    def on_mount(self) -> None:
+        self.query_one("#channel-select", Select).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "cancel":
+            self.dismiss(None)
+            return
+        self.dismiss(self._selected_channel())
+
+    def _selected_channel(self) -> Optional[ChannelInfo]:
+        value = str(self.query_one("#channel-select", Select).value or "")
+        return self.by_id.get(value)
+
+    def _channel_options(self) -> list[tuple[str, str]]:
+        if not self.channels:
+            return [("No channels found", "")]
+        options = []
+        for channel in self.channels:
+            suffix = "Encrypted" if channel.encrypted else "Unencrypted"
+            option_id = f"channel-{channel.index}"
+            options.append((f"{channel.index}. {channel.name} ({suffix})", option_id))
+        return options
+
+
+class MessageActionScreen(ModalScreen[str]):
+    ACTIONS = ("Reply", "React", "Traceroute", "Back")
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def compose(self) -> ComposeResult:
+        with Container(id="bbs-dialog"):
+            yield OptionList(*(Option(action, id=action.lower()) for action in self.ACTIONS), id="action-list")
+
+    def on_mount(self) -> None:
+        self.query_one("#action-list", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(str(event.option_id or "back"))
+
+    def action_cancel(self) -> None:
+        self.dismiss("back")
+
+
+class EmojiSelectScreen(ModalScreen[str]):
+    COLUMNS = 16
+    VISIBLE_ROWS = 16
+    BINDINGS = [
+        ("escape", "cancel", "Cancel"),
+        ("enter", "select", "Select"),
+        ("up", "cursor_up", "Up"),
+        ("down", "cursor_down", "Down"),
+        ("left", "cursor_left", "Left"),
+        ("right", "cursor_right", "Right"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.emojis = _system_emoji_choices()
+        self.selected_index = 0
+        self.row_offset = 0
+
+    def compose(self) -> ComposeResult:
+        with Container(id="emoji-dialog"):
+            yield Static("Выбор реакции", id="emoji-title")
+            yield Static("", id="emoji-grid", markup=True)
+            yield Static("", id="emoji-scroll")
+
+    def on_mount(self) -> None:
+        self._render_emojis()
+
+    def action_cancel(self) -> None:
+        self.dismiss("")
+
+    def action_select(self) -> None:
+        self.dismiss(self.emojis[self.selected_index])
+
+    def action_cursor_up(self) -> None:
+        self._move_selection(-self.COLUMNS)
+
+    def action_cursor_down(self) -> None:
+        self._move_selection(self.COLUMNS)
+
+    def action_cursor_left(self) -> None:
+        self._move_selection(-1)
+
+    def action_cursor_right(self) -> None:
+        self._move_selection(1)
+
+    def _move_selection(self, delta: int) -> None:
+        self.selected_index = max(0, min(len(self.emojis) - 1, self.selected_index + delta))
+        selected_row = self.selected_index // self.COLUMNS
+        if selected_row < self.row_offset:
+            self.row_offset = selected_row
+        elif selected_row >= self.row_offset + self.VISIBLE_ROWS:
+            self.row_offset = selected_row - self.VISIBLE_ROWS + 1
+        self._render_emojis()
+
+    def _render_emojis(self) -> None:
+        grid = []
+        start = self.row_offset * self.COLUMNS
+        end = min(len(self.emojis), start + self.COLUMNS * self.VISIBLE_ROWS)
+        for row_start in range(start, end, self.COLUMNS):
+            cells = []
+            for index in range(row_start, min(row_start + self.COLUMNS, len(self.emojis))):
+                emoji = escape(self.emojis[index])
+                if index == self.selected_index:
+                    cells.append(f"[black on white] {emoji} [/black on white]")
+                else:
+                    cells.append(f" {emoji} ")
+            grid.append("".join(cells))
+        total_rows = max(1, (len(self.emojis) + self.COLUMNS - 1) // self.COLUMNS)
+        self.query_one("#emoji-grid", Static).update("\n".join(grid))
+        self.query_one("#emoji-scroll", Static).update(
+            f"{self.row_offset + 1}-{min(total_rows, self.row_offset + self.VISIBLE_ROWS)} / {total_rows}"
+        )
+
+
 class ConnectionScreen(ModalScreen[None]):
     BINDINGS = [
         ("left", "previous_tab", "Previous"),
@@ -145,7 +317,7 @@ class ConnectionScreen(ModalScreen[None]):
                     value=str(self.settings.serial_baudrate or 115200),
                     id="serial-speed",
                 )
-                with Horizontal(classes="center-row"):
+                with Horizontal(classes="center-row connect-button-row"):
                     yield Button("CONNECT", id="serial-connect", variant="primary", classes="center-button")
 
             with Vertical(id="ble-pane", classes="connect-pane"):
@@ -154,7 +326,7 @@ class ConnectionScreen(ModalScreen[None]):
                 yield Static("=== Devices ===", classes="section-title")
                 yield OptionList(id="ble-list")
                 yield Input(placeholder="PIN code, if required", password=True, id="ble-pin")
-                with Horizontal(classes="center-row"):
+                with Horizontal(classes="center-row connect-button-row"):
                     yield Button("Scan", id="ble-scan", variant="primary", classes="center-button")
                 yield Static("Select device with arrows and press Enter.", id="ble-help")
 
@@ -313,16 +485,23 @@ class ConnectionScreen(ModalScreen[None]):
 class MainMenuScreen(Screen):
     BINDINGS = [
         ("tab", "toggle_focus", "Focus"),
+        ("shift+tab", "toggle_focus_back", "Focus back"),
         ("escape", "disconnect", "Disconnect"),
     ]
 
-    TOOLBAR = ("Nodes", "Send File", "Traceroute", "Change Device")
+    TOOLBAR = ("Channels", "Send File", "Traceroute", "Change Device")
+    FOCUS_ORDER = ("toolbar", "chat", "nodes", "input")
 
     def __init__(self) -> None:
         super().__init__()
         self.toolbar_active = False
         self.toolbar_index = 0
         self.node_ids: dict[str, NodeTarget] = {}
+        self.transmitting = False
+        self.focus_area = "input"
+        self.chat_lines: list[ChatLine] = []
+        self.selected_chat_index: Optional[int] = None
+        self.pending_reply: Optional[ChatRecord] = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="dos-root"):
@@ -330,11 +509,10 @@ class MainMenuScreen(Screen):
             with Horizontal(id="toolbar"):
                 for index, label in enumerate(self.TOOLBAR):
                     yield Button(label, id=f"tool-{index}", classes="tool-button")
-                yield Button("Stop transmit", id="stop-transmit", variant="error", classes="stop-button")
                 yield Static("DISCONNECTED", id="device-status")
             with Horizontal(id="chat-body"):
                 with Vertical(id="chat-panel"):
-                    yield Static("#meshdrop  (Meshtastic IRC - file chat over the mesh)", id="chat-topic")
+                    yield Static("", id="chat-topic")
                     yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
                     yield Static("", id="transfer-message")
                 with Vertical(id="node-panel"):
@@ -343,7 +521,7 @@ class MainMenuScreen(Screen):
             with Horizontal(id="input-row"):
                 yield Static(">", id="prompt")
                 yield Input(placeholder="Type a message", id="message-input")
-                yield Static("Recipient: broadcast", id="recipient-status")
+                yield Static("Recipient: none", id="recipient-status")
             yield Static("RX: waiting for incoming file offer", id="receive-status")
             yield ProgressBar(total=100, id="receive-progress")
             yield Static("", id="receive-stats")
@@ -355,27 +533,27 @@ class MainMenuScreen(Screen):
         self._update_toolbar()
         self.set_transmitting(False)
         self.query_one("#message-input", Input).focus()
+        self._update_recipient_status()
+        self._update_channel_view()
         if self.app.transport is not None:  # type: ignore[attr-defined]
-            asyncio.create_task(self.refresh_nodes())
-        self.write_chat("* receive mode enabled")
+            asyncio.create_task(self.refresh_nodes(quiet=True))
 
     def on_screen_resume(self) -> None:
         self._set_connected_state()
         self._update_toolbar()
-        if self.app.transport is not None:  # type: ignore[attr-defined]
-            asyncio.create_task(self.refresh_nodes())
+        self._update_recipient_status()
+        self._update_channel_view()
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         if button_id.startswith("tool-"):
             self.toolbar_index = int(button_id.removeprefix("tool-"))
             await self.activate_toolbar_item()
-        elif button_id == "stop-transmit":
-            self.app.stop_transfer()  # type: ignore[attr-defined]
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "message-input":
             return
+        self.focus_area = "input"
         text = event.value.strip()
         event.input.value = ""
         if not text:
@@ -389,23 +567,53 @@ class MainMenuScreen(Screen):
         if node is None:
             return
         self.app.selected_node = node  # type: ignore[attr-defined]
-        self.query_one("#recipient-status", Static).update(f"Recipient: {node.name}")
-        self.write_chat(f"* recipient selected: {node.name} ({node.node_id})")
+        self._update_recipient_status()
+        if not self.app.in_channel_mode:  # type: ignore[attr-defined]
+            self.write_chat(f"* recipient selected: {node.name} ({node.node_id})")
 
     async def on_key(self, event) -> None:
         key = event.key
-        if key == "alt":
-            self.toolbar_active = not self.toolbar_active
-            self._update_toolbar()
+        if key == "tab":
+            self._cycle_focus(1)
             event.stop()
             return
+        if key in ("shift+tab", "backtab"):
+            self._cycle_focus(-1)
+            event.stop()
+            return
+        if key == "alt":
+            self._set_focus_area("toolbar")
+            event.stop()
+            return
+        message_input = self.query_one("#message-input", Input)
+        if key == "enter" and message_input.has_focus:
+            self.focus_area = "input"
+            text = message_input.value.strip()
+            message_input.value = ""
+            if text:
+                await self.send_chat_message(text)
+            event.stop()
+            return
+        if self.focus_area == "chat":
+            if key == "up":
+                self._move_chat_selection(-1)
+                event.stop()
+                return
+            if key == "down":
+                self._move_chat_selection(1)
+                event.stop()
+                return
+            if key == "enter":
+                self.open_selected_message_actions()
+                event.stop()
+                return
         if self.toolbar_active:
             if key == "left":
-                self.toolbar_index = (self.toolbar_index - 1) % len(self.TOOLBAR)
+                self.toolbar_index = self._next_toolbar_index(-1)
                 self._update_toolbar()
                 event.stop()
             elif key == "right":
-                self.toolbar_index = (self.toolbar_index + 1) % len(self.TOOLBAR)
+                self.toolbar_index = self._next_toolbar_index(1)
                 self._update_toolbar()
                 event.stop()
             elif key == "enter":
@@ -417,20 +625,19 @@ class MainMenuScreen(Screen):
                 event.stop()
 
     async def action_refresh_nodes(self) -> None:
-        await self.refresh_nodes()
+        await self.refresh_nodes(quiet=True)
 
     def action_toggle_focus(self) -> None:
-        nodes = self.query_one("#nodes", OptionList)
-        message_input = self.query_one("#message-input", Input)
-        if nodes.has_focus:
-            message_input.focus()
-            nodes.set_class(False, "focused-panel")
-        else:
-            nodes.focus()
-            nodes.set_class(True, "focused-panel")
+        self._cycle_focus(1)
+
+    def action_toggle_focus_back(self) -> None:
+        self._cycle_focus(-1)
 
     def action_disconnect(self) -> None:
-        self.app.disconnect_device()  # type: ignore[attr-defined]
+        if self.app.transport is None:  # type: ignore[attr-defined]
+            self.app.exit()  # type: ignore[attr-defined]
+        else:
+            self.app.disconnect_device()  # type: ignore[attr-defined]
 
     async def action_send_file(self) -> None:
         await self.begin_send()
@@ -439,22 +646,47 @@ class MainMenuScreen(Screen):
         action = self.TOOLBAR[self.toolbar_index]
         self.toolbar_active = False
         self._update_toolbar()
-        if action == "Nodes":
-            await self.refresh_nodes()
-            self.query_one("#nodes", OptionList).focus()
-            self.query_one("#nodes", OptionList).set_class(True, "focused-panel")
+        if action == "Channels":
+            await self.open_channels()
+        elif action == "Send File" and self.app.in_channel_mode:  # type: ignore[attr-defined]
+            self.write_chat("* file transfer is disabled in public channels")
+        elif action == "Send File" and self.transmitting:
+            self.app.stop_transfer()  # type: ignore[attr-defined]
         elif action == "Send File":
             await self.begin_send()
         elif action == "Traceroute":
-            await self.run_traceroute()
+            self.start_traceroute()
         elif action == "Change Device":
             self.app.show_connection_dialog()  # type: ignore[attr-defined]
 
-    async def refresh_nodes(self) -> None:
+    async def open_channels(self) -> None:
         if self.app.transport is None:  # type: ignore[attr-defined]
-            self.write_chat("* not connected")
+            self.app.show_error("ERROR! Not connected.")  # type: ignore[attr-defined]
             return
-        self.write_chat("* loading nodes...")
+        try:
+            channels = await self.app.load_channels()  # type: ignore[attr-defined]
+        except Exception as exc:
+            self.app.show_error(f"ERROR! Could not load channels: {exc}")  # type: ignore[attr-defined]
+            return
+        self.app.push_screen(ChannelSelectScreen(channels), callback=self._handle_channel_selected)  # type: ignore[attr-defined]
+
+    def _handle_channel_selected(self, channel: Optional[ChannelInfo]) -> None:
+        if channel is None:
+            return
+        self.app.connect_channel(channel)  # type: ignore[attr-defined]
+        if self.toolbar_index == 1:
+            self.toolbar_index = 2
+        self._update_channel_view()
+        self._update_toolbar()
+        self._update_recipient_status()
+        suffix = "Encrypted" if channel.encrypted else "Unencrypted"
+        self.write_system(f"#{channel.name} ({suffix})")
+
+    async def refresh_nodes(self, quiet: bool = False) -> None:
+        if self.app.transport is None:  # type: ignore[attr-defined]
+            if not quiet:
+                self.write_chat("* not connected")
+            return
         try:
             nodes = await self.app.load_nodes()  # type: ignore[attr-defined]
         except Exception as exc:
@@ -471,21 +703,24 @@ class MainMenuScreen(Screen):
         for index, node in enumerate(nodes):
             option_id = f"node-{index}"
             heard = human_last_heard(node.last_heard)
-            snr = "?" if node.snr is None else f"{node.snr:.1f}dB"
-            option_list.add_option(Option(f"{node.name:<18} {heard:>4} {snr:>8}", id=option_id))
+            signal = _format_node_signal(node)
+            option_list.add_option(Option(f"{node.name:<18} {heard:>4} {signal:>18}", id=option_id))
             self.node_ids[option_id] = node
             self.app.nodes_by_key[option_id] = node  # type: ignore[attr-defined]
             self.app.nodes_by_key[node.node_id] = node  # type: ignore[attr-defined]
             self.app.nodes_by_key[node.destination] = node  # type: ignore[attr-defined]
             if isinstance(node.destination, int):
                 self.app.nodes_by_key[f"!{node.destination:08x}"] = node  # type: ignore[attr-defined]
-        if nodes:
-            self.write_chat(f"* nodes loaded: {len(nodes)}")
-        else:
+        if not nodes:
             option_list.add_option(Option("No nodes heard", id="empty", disabled=True))
-            self.write_chat("* no nodes heard")
+            if not quiet:
+                self.write_chat("* no nodes heard")
+        self._update_recipient_status()
 
     async def begin_send(self) -> None:
+        if self.app.in_channel_mode:  # type: ignore[attr-defined]
+            self.app.show_error("ERROR! File transfer is disabled in public channels.")  # type: ignore[attr-defined]
+            return
         if self.app.manager is None:  # type: ignore[attr-defined]
             self.app.show_error("ERROR! Not connected.")  # type: ignore[attr-defined]
             return
@@ -526,11 +761,13 @@ class MainMenuScreen(Screen):
 
     def apply_connection_state(self) -> None:
         self._set_connected_state()
-        self.write_chat(f"* connected to {self.app.connected_node_name}")  # type: ignore[attr-defined]
-        asyncio.create_task(self.refresh_nodes())
+        if self.app.transport is not None:  # type: ignore[attr-defined]
+            self.write_chat(f"* connected to {self.app.connected_node_name}")  # type: ignore[attr-defined]
+            asyncio.create_task(self.refresh_nodes(quiet=True))
 
     def show_receive_waiting(self, offer: IncomingOffer) -> None:
         metadata = offer.metadata
+        self.query_one("#receive-status", Static).display = True
         self.query_one("#receive-progress", ProgressBar).display = True
         self.query_one("#receive-stats", Static).display = True
         self.query_one("#receive-status", Static).update(
@@ -545,6 +782,7 @@ class MainMenuScreen(Screen):
         self._hide_receive_progress()
 
     def apply_receive_snapshot(self, snapshot: TransferSnapshot) -> None:
+        self.query_one("#receive-status", Static).display = True
         self.query_one("#receive-progress", ProgressBar).display = True
         self.query_one("#receive-stats", Static).display = True
         self.query_one("#receive-progress", ProgressBar).update(progress=snapshot.progress * 100)
@@ -554,6 +792,7 @@ class MainMenuScreen(Screen):
             self.write_chat(f"* received {snapshot.file_name}")
 
     def apply_send_snapshot(self, snapshot: TransferSnapshot) -> None:
+        self.query_one("#receive-status", Static).display = True
         self.query_one("#receive-progress", ProgressBar).display = True
         self.query_one("#receive-stats", Static).display = True
         self.query_one("#receive-progress", ProgressBar).update(progress=snapshot.progress * 100)
@@ -562,8 +801,13 @@ class MainMenuScreen(Screen):
         self._update_transfer_message(snapshot)
         if snapshot.state in {"complete", "error", "stopped"}:
             self.set_transmitting(False)
+            self._hide_transfer_message()
+            self.clear_receive_waiting()
+            if snapshot.state == "complete":
+                self.write_chat(f"* sent {snapshot.file_name} to {snapshot.node_name}")
 
     def _hide_receive_progress(self) -> None:
+        self.query_one("#receive-status", Static).display = False
         self.query_one("#receive-progress", ProgressBar).display = False
         self.query_one("#receive-stats", Static).display = False
 
@@ -576,10 +820,12 @@ class MainMenuScreen(Screen):
         transfer_message.update(_format_chat_transfer_message(snapshot))
 
     def _set_connected_state(self) -> None:
+        status = self.query_one("#device-status", Static)
         if self.app.transport is None:  # type: ignore[attr-defined]
-            self.query_one("#device-status", Static).update("DISCONNECTED")
+            status.update("DISCONNECTED")
         else:
-            self.query_one("#device-status", Static).update(self.app.device_status_text())  # type: ignore[attr-defined]
+            max_width = max(12, status.size.width or 46)
+            status.update(self.app.device_status_text(max_width=max_width))  # type: ignore[attr-defined]
 
     async def send_chat_message(self, text: str) -> None:
         if self.app.transport is None:  # type: ignore[attr-defined]
@@ -589,27 +835,45 @@ class MainMenuScreen(Screen):
             self.app.show_error("ERROR! Message is longer than 200 bytes.")  # type: ignore[attr-defined]
             return
         target = self.app.selected_node  # type: ignore[attr-defined]
-        destination = target.destination if target is not None else "^all"
+        if self.app.in_channel_mode:  # type: ignore[attr-defined]
+            destination = "^all"
+        elif target is not None:
+            destination = target.destination
+        else:
+            self.app.show_error("ERROR! Choose a recipient node.")  # type: ignore[attr-defined]
+            return
+        reply_id = self.pending_reply.packet_id if self.pending_reply is not None else None
         try:
-            await asyncio.to_thread(
+            packet_id = await asyncio.to_thread(
                 self.app.transport.send_text,  # type: ignore[attr-defined]
                 text,
                 destination,
                 self.app.channel_index,  # type: ignore[attr-defined]
                 False,
+                reply_id,
             )
         except Exception:
             self.app._show_local_device_lost()  # type: ignore[attr-defined]
             return
-        self.write_own_message(self.app.local_display_name(), text)  # type: ignore[attr-defined]
+        sender = self.app.local_display_name()  # type: ignore[attr-defined]
+        if self.pending_reply is not None:
+            self.write_reply_quote(self.pending_reply.sender, self.pending_reply.text)
+        record = self.app.remember_chat_message(packet_id, sender, text, own=True, node=target)  # type: ignore[attr-defined]
+        self.write_own_message(sender, text, record=record)
+        self.pending_reply = None
+        self.query_one("#message-input", Input).placeholder = "Type a message"
 
-    async def run_traceroute(self) -> None:
-        if self.app.transport is None:  # type: ignore[attr-defined]
-            self.app.show_error("ERROR! Not connected.")  # type: ignore[attr-defined]
-            return
-        target = self.app.selected_node  # type: ignore[attr-defined]
+    def start_traceroute(self, target: Optional[NodeTarget] = None) -> None:
+        if target is None:
+            target = self.app.selected_node  # type: ignore[attr-defined]
         if target is None:
             self.app.show_error("ERROR! Choose a recipient node.")  # type: ignore[attr-defined]
+            return
+        asyncio.create_task(self.run_traceroute(target))
+
+    async def run_traceroute(self, target: NodeTarget) -> None:
+        if self.app.transport is None:  # type: ignore[attr-defined]
+            self.app.show_error("ERROR! Not connected.")  # type: ignore[attr-defined]
             return
         self.write_system(f"* Tracerout sended to {target.name}...")
         try:
@@ -632,21 +896,104 @@ class MainMenuScreen(Screen):
         self.write_system(f"* [TX] {result.tx}")
         self.write_system(f"* [RX] {result.rx}")
 
+    def open_selected_message_actions(self) -> None:
+        record = self.selected_chat_record()
+        if record is None:
+            return
+        self.app.push_screen(MessageActionScreen(), callback=lambda action: self._handle_message_action(action, record))  # type: ignore[attr-defined]
+
+    def _handle_message_action(self, action: str, record: ChatRecord) -> None:
+        if action == "reply":
+            if record.packet_id is None:
+                self.write_chat("* cannot reply to this message")
+                return
+            self.pending_reply = record
+            message_input = self.query_one("#message-input", Input)
+            message_input.placeholder = f"Reply to {record.sender}'s message"
+            self._set_focus_area("input")
+        elif action == "react":
+            if record.packet_id is None:
+                self.write_chat("* cannot react to this message")
+                return
+            self.app.push_screen(EmojiSelectScreen(), callback=lambda emoji: self._send_reaction(record, emoji))  # type: ignore[attr-defined]
+        elif action == "traceroute":
+            if record.node is None:
+                self.write_chat("* traceroute target is unknown")
+                return
+            self.start_traceroute(record.node)
+
+    def _send_reaction(self, record: ChatRecord, emoji: str) -> None:
+        if not emoji:
+            return
+        asyncio.create_task(self._send_reaction_async(record, emoji))
+
+    async def _send_reaction_async(self, record: ChatRecord, emoji: str) -> None:
+        if self.app.transport is None or record.packet_id is None:  # type: ignore[attr-defined]
+            return
+        destination = "^all" if self.app.in_channel_mode or record.node is None else record.node.destination  # type: ignore[attr-defined]
+        try:
+            packet_id = await asyncio.to_thread(
+                self.app.transport.send_reaction,  # type: ignore[attr-defined]
+                emoji,
+                record.packet_id,
+                destination,
+                self.app.channel_index,  # type: ignore[attr-defined]
+            )
+        except Exception as exc:
+            self.app.show_error(f"ERROR! Could not send reaction: {exc}")  # type: ignore[attr-defined]
+            return
+        if packet_id is not None:
+            self.app.sent_reaction_packet_ids.add(packet_id)  # type: ignore[attr-defined]
+        self.add_reaction_to_record(record, emoji)
+
     def write_chat(self, message: str) -> None:
         self.write_system(message)
 
-    def write_system(self, message: str) -> None:
-        self.query_one("#chat-log", RichLog).write(f"[cyan]{escape(message)}[/cyan]")
+    def write_system(self, message: str, timestamp: Optional[float] = None) -> None:
+        self._append_chat_line(ChatLine("cyan", message, timestamp=timestamp))
 
-    def write_own_message(self, node_name: str, text: str) -> None:
-        self.query_one("#chat-log", RichLog).write(
-            f"[magenta]<{escape(node_name)}>: {escape(text)}[/magenta]"
-        )
+    def write_own_message(
+        self,
+        node_name: str,
+        text: str,
+        timestamp: Optional[float] = None,
+        record: Optional[ChatRecord] = None,
+    ) -> None:
+        self._append_chat_line(ChatLine("magenta", f"<{node_name}>: {text}", timestamp=timestamp, record=record))
 
-    def write_peer_message(self, node_name: str, text: str) -> None:
-        self.query_one("#chat-log", RichLog).write(
-            f"[white]<{escape(node_name)}>: {escape(text)}[/white]"
-        )
+    def write_peer_message(
+        self,
+        node_name: str,
+        text: str,
+        timestamp: Optional[float] = None,
+        record: Optional[ChatRecord] = None,
+    ) -> None:
+        self._append_chat_line(ChatLine("white", f"<{node_name}>: {text}", timestamp=timestamp, record=record))
+
+    def write_reply_quote(self, node_name: str, text: str, timestamp: Optional[float] = None) -> None:
+        quote = _quote_text(text)
+        self._append_chat_line(ChatLine("white", f'@{node_name} "{quote}"', timestamp=timestamp))
+
+    def add_reaction_to_record(self, record: ChatRecord, emoji: str) -> None:
+        record.reactions[emoji] = record.reactions.get(emoji, 0) + 1
+        self._render_chat_log()
+
+    def _append_chat_line(self, line: ChatLine) -> None:
+        self.chat_lines.append(line)
+        if line.record is not None:
+            self.selected_chat_index = len(self.chat_lines) - 1
+        self._render_chat_log()
+
+    def _render_chat_log(self) -> None:
+        log = self.query_one("#chat-log", RichLog)
+        log.clear()
+        for index, line in enumerate(self.chat_lines[-400:]):
+            absolute_index = len(self.chat_lines) - min(len(self.chat_lines), 400) + index
+            selected = self.focus_area == "chat" and absolute_index == self.selected_chat_index
+            text = line.text
+            if line.record is not None and line.record.reactions:
+                text = _line_with_reactions(text, line.record.reactions)
+            log.write(_chat_line(line.style, text, timestamp=line.timestamp, selected=selected))
 
     def _update_toolbar(self) -> None:
         toolbar = self.query_one("#toolbar", Horizontal)
@@ -654,22 +1001,114 @@ class MainMenuScreen(Screen):
         for index, _label in enumerate(self.TOOLBAR):
             button = self.query_one(f"#tool-{index}", Button)
             button.set_class(self.toolbar_active and index == self.toolbar_index, "tool-selected")
+            if self.TOOLBAR[index] == "Send File":
+                button.disabled = self.app.in_channel_mode and not self.transmitting  # type: ignore[attr-defined]
 
     def set_transmitting(self, transmitting: bool) -> None:
-        for index, _label in enumerate(self.TOOLBAR):
-            self.query_one(f"#tool-{index}", Button).display = not transmitting
-        self.query_one("#stop-transmit", Button).display = transmitting
+        self.transmitting = transmitting
+        send_button = self.query_one("#tool-1", Button)
+        send_button.label = "Stop Sending" if transmitting else "Send File"
+        send_button.variant = "error" if transmitting else "default"
         self._update_toolbar()
+
+    def _set_focus_area(self, area: str) -> None:
+        self.focus_area = area
+        self.toolbar_active = area == "toolbar"
+        self.query_one("#node-panel", Vertical).set_class(area == "nodes", "focused-panel")
+        self.query_one("#chat-panel", Vertical).set_class(area == "chat", "focused-panel")
+        if area == "nodes":
+            self.query_one("#nodes", OptionList).focus()
+        elif area == "chat":
+            self.query_one("#chat-log", RichLog).focus()
+            if (
+                self.selected_chat_index is None
+                or not (0 <= self.selected_chat_index < len(self.chat_lines))
+                or self.chat_lines[self.selected_chat_index].record is None
+            ):
+                self.selected_chat_index = self._last_selectable_chat_index()
+            self._render_chat_log()
+        elif area == "input":
+            self.query_one("#message-input", Input).focus()
+        self._update_toolbar()
+        if area != "chat":
+            self._render_chat_log()
+
+    def _cycle_focus(self, direction: int) -> None:
+        index = self.FOCUS_ORDER.index(self.focus_area) if self.focus_area in self.FOCUS_ORDER else 0
+        self._set_focus_area(self.FOCUS_ORDER[(index + direction) % len(self.FOCUS_ORDER)])
+
+    def _next_toolbar_index(self, direction: int) -> int:
+        index = self.toolbar_index
+        for _ in self.TOOLBAR:
+            index = (index + direction) % len(self.TOOLBAR)
+            if not self.query_one(f"#tool-{index}", Button).disabled:
+                return index
+        return self.toolbar_index
+
+    def _last_selectable_chat_index(self) -> Optional[int]:
+        for index in range(len(self.chat_lines) - 1, -1, -1):
+            if self.chat_lines[index].record is not None:
+                return index
+        return None
+
+    def _move_chat_selection(self, direction: int) -> None:
+        if not self.chat_lines:
+            return
+        index = self.selected_chat_index
+        if index is None:
+            index = self._last_selectable_chat_index()
+        if index is None:
+            return
+        probe = index
+        while 0 <= probe + direction < len(self.chat_lines):
+            probe += direction
+            if self.chat_lines[probe].record is not None:
+                self.selected_chat_index = probe
+                self._render_chat_log()
+                return
+
+    def selected_chat_record(self) -> Optional[ChatRecord]:
+        if self.selected_chat_index is None:
+            return None
+        if not (0 <= self.selected_chat_index < len(self.chat_lines)):
+            return None
+        return self.chat_lines[self.selected_chat_index].record
+
+    def clear_nodes(self) -> None:
+        self.query_one("#nodes", OptionList).clear_options()
+        self.node_ids.clear()
+        self.app.nodes_by_key.clear()  # type: ignore[attr-defined]
+        self._update_recipient_status()
+
+    def _update_recipient_status(self) -> None:
+        status = self.query_one("#recipient-status", Static)
+        if self.app.in_channel_mode:  # type: ignore[attr-defined]
+            status.display = False
+            return
+        status.display = True
+        node = self.app.selected_node  # type: ignore[attr-defined]
+        status.update(f"Recipient: {node.name}" if node is not None else "Recipient: none")
+
+    def _update_channel_view(self) -> None:
+        topic = self.query_one("#chat-topic", Static)
+        channel = self.app.current_channel  # type: ignore[attr-defined]
+        if channel is None:
+            topic.update("Direct messages")
+            self.query_one("#recipient-status", Static).display = True
+            return
+        suffix = "Encrypted" if channel.encrypted else "Unencrypted"
+        topic.update(f"#{channel.name} ({suffix})")
+        self.query_one("#recipient-status", Static).display = False
 
 
 class MeshShareApp(App):
     CSS = """
-    ConnectionScreen, ErrorScreen, ConfirmSendScreen, ReceiveOfferScreen {
+    ConnectionScreen, ErrorScreen, RetryTransferScreen, ConfirmSendScreen, ReceiveOfferScreen, ChannelSelectScreen, MessageActionScreen, EmojiSelectScreen {
         align: center middle;
     }
 
     Screen {
-        background: black;
+        background: #000000;
         color: #66ff66;
     }
 
@@ -677,6 +1116,7 @@ class MeshShareApp(App):
         width: 100%;
         height: 100%;
         padding: 0 1;
+        background: #000000;
     }
 
     #title-line {
@@ -689,44 +1129,52 @@ class MeshShareApp(App):
         height: 3;
         border: solid #66ff66;
         padding: 0 1;
+        background: #000000;
     }
 
     #toolbar.toolbar-active {
-        background: white;
-        color: black;
+        border: heavy white;
+        background: #000000;
+        color: #66ff66;
     }
 
     .tool-button {
-        width: 17;
-        background: black;
+        width: auto;
+        min-width: 0;
+        background: #000000;
         color: #66ff66;
         border: none;
-        margin-right: 1;
+        margin-right: 2;
+    }
+
+    .tool-button:hover, .tool-button:focus, .tool-button.-active,
+    .tool-button.-style-default, .tool-button.-style-default:hover,
+    .tool-button.-style-default:focus, .tool-button.-style-default.-active {
+        background: #000000;
+        color: #66ff66;
+        background-tint: transparent;
+        tint: transparent;
+        border: none;
+        border-top: none;
+        border-bottom: none;
     }
 
     .tool-button.tool-selected {
-        background: black;
-        color: white;
+        background: white;
+        color: black;
         text-style: bold;
-    }
-
-    .stop-button {
-        width: 20;
-        background: #7a1010;
-        color: white;
-        border: solid #ff5555;
-        text-style: bold;
-        margin-right: 1;
     }
 
     #device-status {
         width: 1fr;
+        margin-left: 0;
         content-align: right middle;
         color: #66ff66;
     }
 
     #chat-body {
         height: 1fr;
+        background: #000000;
     }
 
     #chat-panel {
@@ -734,6 +1182,11 @@ class MeshShareApp(App):
         height: 100%;
         border: solid #66ff66;
         margin-right: 1;
+        background: #000000;
+    }
+
+    #chat-panel.focused-panel {
+        border: heavy white;
     }
 
     #chat-topic {
@@ -745,8 +1198,15 @@ class MeshShareApp(App):
     #chat-log {
         height: 1fr;
         padding: 0 1;
-        background: black;
+        background: #000000;
         color: #d0d0d0;
+        background-tint: transparent;
+    }
+
+    #chat-log:focus {
+        background: #000000;
+        color: #d0d0d0;
+        background-tint: transparent;
     }
 
     #transfer-message {
@@ -754,13 +1214,18 @@ class MeshShareApp(App):
         padding: 0 1;
         border-top: solid #66ff66;
         color: #33dddd;
-        background: black;
+        background: #000000;
     }
 
     #node-panel {
         width: 34;
         height: 100%;
         border: solid #66ff66;
+        background: #000000;
+    }
+
+    #node-panel.focused-panel {
+        border: heavy white;
     }
 
     #nodes-title {
@@ -772,19 +1237,33 @@ class MeshShareApp(App):
 
     #nodes {
         height: 1fr;
-        background: black;
+        background: #000000;
         color: #66ff66;
-        border: none;
+        border: none !important;
+        padding: 0;
+        background-tint: transparent;
     }
 
-    #nodes.focused-panel {
-        border: solid white;
+    #nodes:focus {
+        background: #000000;
+        color: #66ff66;
+        background-tint: transparent;
+        border: none !important;
+    }
+
+    #nodes > .option-list--option-highlighted,
+    #nodes:focus > .option-list--option-highlighted,
+    #nodes > .option-list--option-hover {
+        background: #000000;
+        color: white;
+        text-style: bold;
     }
 
     #input-row {
         height: 3;
         border: solid #66ff66;
         margin-top: 1;
+        background: #000000;
     }
 
     #prompt {
@@ -795,9 +1274,29 @@ class MeshShareApp(App):
 
     #message-input {
         width: 1fr;
-        background: black;
+        background: #000000;
         color: #d0d0d0;
         border: none;
+        background-tint: transparent;
+    }
+
+    #message-input:focus {
+        background: #000000;
+        color: #d0d0d0;
+        border: none;
+        background-tint: transparent;
+    }
+
+    #message-input > .input--cursor {
+        background: #000000;
+        color: white;
+        text-style: reverse;
+    }
+
+    #message-input > .input--selection {
+        background: #000000;
+        color: white;
+        text-style: bold;
     }
 
     #recipient-status {
@@ -822,7 +1321,9 @@ class MeshShareApp(App):
 
     #connect-dialog {
         width: 76;
+        max-width: 76;
         height: auto;
+        max-height: 32;
         padding: 1 2;
         background: black;
         color: #66ff66;
@@ -850,10 +1351,11 @@ class MeshShareApp(App):
     }
 
     .connect-pane {
-        min-height: 16;
+        height: auto;
+        max-height: 22;
     }
 
-    #paired-list, #ble-list {
+    #paired-list, #ble-list, #channel-list {
         height: 5;
         border: solid #66ff66;
         margin-bottom: 1;
@@ -874,6 +1376,10 @@ class MeshShareApp(App):
         align-horizontal: center;
     }
 
+    .connect-button-row {
+        margin-top: 1;
+    }
+
     #dialog, #error-dialog {
         width: 72;
         height: auto;
@@ -881,6 +1387,51 @@ class MeshShareApp(App):
         background: black;
         color: #66ff66;
         border: thick #66ff66;
+    }
+
+    #bbs-dialog {
+        width: 24;
+        height: auto;
+        padding: 1 2;
+        background: black;
+        color: #66ff66;
+        border: thick #66ff66;
+    }
+
+    #action-list, #emoji-list {
+        height: auto;
+        background: black;
+        color: #66ff66;
+        border: none;
+    }
+
+    #emoji-dialog {
+        width: 64;
+        height: 22;
+        padding: 1 2;
+        background: black;
+        color: #66ff66;
+        border: thick #66ff66;
+    }
+
+    #emoji-title {
+        height: 1;
+        color: #33dddd;
+        text-style: bold;
+        content-align: center middle;
+        margin-bottom: 1;
+    }
+
+    #emoji-grid {
+        height: 16;
+        background: black;
+        color: #d0d0d0;
+    }
+
+    #emoji-scroll {
+        height: 1;
+        color: #33dddd;
+        content-align: right middle;
     }
 
     #error-dialog {
@@ -895,6 +1446,18 @@ class MeshShareApp(App):
 
     .dialog-buttons {
         height: auto;
+    }
+
+    .channel-dialog-buttons {
+        margin-top: 1;
+    }
+
+    .channel-connect-button {
+        margin-left: 2;
+    }
+
+    .channel-cancel-button {
+        margin-left: 3;
     }
     """
 
@@ -917,8 +1480,12 @@ class MeshShareApp(App):
         self.selected_node: Optional[NodeTarget] = None
         self.selected_file: Optional[Path] = None
         self.channel_index = 0
+        self.current_channel: Optional[ChannelInfo] = None
+        self.in_channel_mode = False
         self.transfer_task: Optional[asyncio.Task[None]] = None
         self._fatal_device_lost = False
+        self.chat_messages_by_packet_id: dict[int, ChatRecord] = {}
+        self.sent_reaction_packet_ids: set[int] = set()
 
     def on_mount(self) -> None:
         self.push_screen(MainMenuScreen())
@@ -959,6 +1526,9 @@ class MeshShareApp(App):
         self.connected_node_name = local_name or config.name or config.endpoint or config.kind
         self.selected_node = None
         self.selected_file = None
+        self.channel_index = 0
+        self.current_channel = None
+        self.in_channel_mode = False
         self._remember_successful_connection(config, local_name)
         if isinstance(self.screen, MainMenuScreen):
             self.screen.apply_connection_state()
@@ -981,6 +1551,16 @@ class MeshShareApp(App):
             raise RuntimeError("not connected")
         return await asyncio.to_thread(self.transport.list_nodes)
 
+    async def load_channels(self) -> list[ChannelInfo]:
+        if self.transport is None:
+            raise RuntimeError("not connected")
+        return await asyncio.to_thread(self.transport.list_channels)
+
+    def connect_channel(self, channel: ChannelInfo) -> None:
+        self.current_channel = channel
+        self.channel_index = channel.index
+        self.in_channel_mode = True
+
     async def send_file(self, file_path: Path, target: NodeTarget, channel_index: int) -> None:
         assert self.manager is not None
         try:
@@ -995,6 +1575,8 @@ class MeshShareApp(App):
                     self.switch_screen(MainMenuScreen())
             elif message == TIMEOUT_ERROR:
                 self.show_error("Signal Lost!", callback=lambda: self.switch_screen(MainMenuScreen()))
+            elif message == SYNC_ERROR:
+                self.show_retry_transfer_error(file_path, target, channel_index)
             else:
                 self.show_error(message)
         except Exception:
@@ -1005,8 +1587,9 @@ class MeshShareApp(App):
             self.transfer_task = None
 
     def stop_transfer(self) -> None:
-        if self.manager is not None:
-            self.manager.stop_active_transfer()
+        manager = self.manager
+        if manager is not None:
+            asyncio.create_task(asyncio.to_thread(manager.stop_active_transfer))
 
     def disconnect_device(self) -> None:
         if self.manager is not None:
@@ -1018,18 +1601,41 @@ class MeshShareApp(App):
         self.connected_node_name = ""
         self.connection_kind = ""
         self.selected_node = None
+        self.current_channel = None
+        self.in_channel_mode = False
+        self.channel_index = 0
         if isinstance(self.screen, MainMenuScreen):
             self.screen.write_chat("* device disconnected")
+            self.screen.clear_nodes()
             self.screen.apply_connection_state()
 
-    def device_status_text(self) -> str:
+    def device_status_text(self, max_width: int = 46) -> str:
         if self.transport is None:
             return "DISCONNECTED"
         status = self.transport.get_local_status()
-        name = status.name or self.connected_node_name or "node"
-        battery = "N/A" if status.battery_level is None else f"{status.battery_level}%"
-        voltage = "?" if status.voltage is None else f"{status.voltage:.2f}V"
-        return f"{name} | {self.connection_kind or '?'} | {battery} {voltage}"
+        name = getattr(status, "name", "") or self.connected_node_name or "node"
+        battery_level = getattr(status, "battery_level", None)
+        voltage_value = getattr(status, "voltage", None)
+        voltage = _format_voltage(voltage_value)
+        if getattr(status, "powered", False) or (battery_level is not None and battery_level > 100):
+            power = "[POWERED]" if voltage is None else f"[POWERED] {voltage}"
+            return _format_device_status(name, self.connection_kind or "?", power, max_width=max_width)
+        battery = "N/A" if battery_level is None else f"{battery_level}%"
+        return _format_device_status(name, self.connection_kind or "?", f"{battery} {voltage or '?'}", max_width=max_width)
+
+    def remember_chat_message(
+        self,
+        packet_id: Optional[int],
+        sender: str,
+        text: str,
+        own: bool,
+        node: Optional[NodeTarget] = None,
+        timestamp: Optional[float] = None,
+    ) -> ChatRecord:
+        record = ChatRecord(sender=sender, text=text, own=own, packet_id=packet_id, node=node, timestamp=timestamp)
+        if packet_id is not None:
+            self.chat_messages_by_packet_id[packet_id] = record
+        return record
 
     def local_display_name(self) -> str:
         if self.transport is not None:
@@ -1042,6 +1648,15 @@ class MeshShareApp(App):
         return self.connected_node_name or "this-node"
 
     def peer_display_name(self, message) -> str:
+        node = self.peer_node_for_message(message)
+        if node is not None:
+            return node.name
+        sender = getattr(message, "from_id", None) or getattr(message, "from_node_num", None)
+        if isinstance(sender, int):
+            return f"!{sender:08x}"
+        return str(sender or "unknown")
+
+    def peer_node_for_message(self, message) -> Optional[NodeTarget]:
         keys = _message_sender_keys(message)
         seen_nodes: set[int] = set()
         for node in self.nodes_by_key.values():
@@ -1055,17 +1670,16 @@ class MeshShareApp(App):
             if isinstance(node.destination, int):
                 node_keys.add(f"!{node.destination:08x}")
             if keys.intersection(node_keys):
-                return node.name
-        sender = getattr(message, "from_id", None) or getattr(message, "from_node_num", None)
-        if isinstance(sender, int):
-            return f"!{sender:08x}"
-        return str(sender or "unknown")
+                return node
+        return None
 
     def _handle_mesh_message(self, message) -> None:
         try:
             parse_frame(message.text)
         except ProtocolError:
-            if isinstance(message.text, str) and message.text.startswith("MS1|"):
+            if isinstance(message.text, str) and is_protocol_like(message.text):
+                return
+            if self.in_channel_mode and message.channel_index != self.channel_index:
                 return
             self.call_from_thread(self._append_incoming_chat, message)
             return
@@ -1081,7 +1695,41 @@ class MeshShareApp(App):
     def _append_incoming_chat(self, message) -> None:
         if isinstance(self.screen, MainMenuScreen):
             sender = self.peer_display_name(message)
-            self.screen.write_peer_message(sender, message.text)
+            node = self.peer_node_for_message(message)
+            if message.emoji and message.reply_id is not None:
+                if message.packet_id is not None and message.packet_id in self.sent_reaction_packet_ids:
+                    self.sent_reaction_packet_ids.discard(message.packet_id)
+                    return
+                referenced = self.chat_messages_by_packet_id.get(message.reply_id)
+                if referenced is not None:
+                    self.screen.add_reaction_to_record(referenced, message.emoji)
+                else:
+                    self.screen.write_system(
+                        f"* reaction {message.emoji} from {sender} to unknown message",
+                        timestamp=message.timestamp,
+                    )
+                return
+
+            referenced = (
+                self.chat_messages_by_packet_id.get(message.reply_id)
+                if message.reply_id is not None
+                else None
+            )
+            if referenced is not None:
+                self.screen.write_reply_quote(
+                    referenced.sender,
+                    referenced.text,
+                    timestamp=message.timestamp,
+                )
+            record = self.remember_chat_message(
+                message.packet_id,
+                sender,
+                message.text,
+                own=False,
+                node=node,
+                timestamp=message.timestamp,
+            )
+            self.screen.write_peer_message(sender, message.text, timestamp=message.timestamp, record=record)
 
     def _incoming_offer_from_worker(self, offer: IncomingOffer) -> bool:
         event = threading.Event()
@@ -1156,6 +1804,17 @@ class MeshShareApp(App):
     def show_error(self, message: str, callback: Optional[Callable[[], None]] = None) -> None:
         self.push_screen(ErrorScreen(message), callback=lambda _: callback() if callback else None)
 
+    def show_retry_transfer_error(self, file_path: Path, target: NodeTarget, channel_index: int) -> None:
+        def done(retry: bool) -> None:
+            if retry:
+                if isinstance(self.screen, MainMenuScreen):
+                    self.screen.set_transmitting(True)
+                self.transfer_task = asyncio.create_task(self.send_file(file_path, target, channel_index))
+            elif isinstance(self.screen, MainMenuScreen):
+                self.screen.set_transmitting(False)
+
+        self.push_screen(RetryTransferScreen(SYNC_ERROR), callback=done)
+
     def on_unmount(self) -> None:
         if self.manager is not None:
             self.manager.close()
@@ -1189,6 +1848,165 @@ def _message_sender_keys(message) -> set[object]:
         if isinstance(value, int):
             keys.add(f"!{value:08x}")
     return keys
+
+
+def _format_node_signal(node: NodeTarget) -> str:
+    snr = "?" if node.snr is None else f"{node.snr:.1f}dB"
+    if node.hops_away is None:
+        hops = "? Hops"
+    elif node.hops_away <= 0:
+        hops = "Direct"
+    else:
+        hops = f"{node.hops_away} Hops"
+    return f"{snr} | {hops}"
+
+
+def _format_device_status(name: str, connection_kind: str, power: str, max_width: int = 46) -> str:
+    suffix = f" | {connection_kind} | {power}"
+    budget = max(3, max_width - len(suffix))
+    return f"{_ellipsize(name, budget)}{suffix}"
+
+
+def _format_voltage(voltage: Optional[float]) -> Optional[str]:
+    if voltage is None or voltage <= 0:
+        return None
+    return f"{voltage:.2f}V"
+
+
+def _line_with_reactions(text: str, reactions: dict[str, int], width: int = 92) -> str:
+    suffix = _format_reactions(reactions)
+    if not suffix:
+        return text
+    gap = max(1, width - len(text) - len(suffix))
+    return f"{text}{' ' * gap}{suffix}"
+
+
+def _format_reactions(reactions: dict[str, int], max_width: int = 28) -> str:
+    parts = [f"{count}x{emoji}" for emoji, count in reactions.items()]
+    result: list[str] = []
+    used = 0
+    for part in parts:
+        next_used = used + len(part) + (1 if result else 0)
+        if next_used > max_width:
+            result.append("...")
+            break
+        result.append(part)
+        used = next_used
+    return "|".join(result)
+
+
+def _ellipsize(text: str, max_length: int) -> str:
+    if len(text) <= max_length:
+        return text
+    if max_length <= 3:
+        return "." * max_length
+    return text[: max_length - 3].rstrip() + "..."
+
+
+def _system_emoji_choices() -> tuple[str, ...]:
+    emoji_ranges = (
+        (0x1F600, 0x1F64F),  # smileys
+        (0x1F900, 0x1F9FF),  # faces, hands, people, animals
+        (0x1FA70, 0x1FAFF),  # newer symbols
+        (0x1F300, 0x1F5FF),  # nature, food, activities, objects
+        (0x1F680, 0x1F6FF),  # transport
+        (0x2600, 0x27BF),    # symbols and dingbats
+        (0x2B00, 0x2BFF),    # arrows and geometric emoji
+    )
+    choices: list[str] = []
+    seen: set[str] = set()
+    for start, end in emoji_ranges:
+        for codepoint in range(start, end + 1):
+            if 0x1F3FB <= codepoint <= 0x1F3FF:
+                continue
+            char = chr(codepoint)
+            name = unicodedata.name(char, "")
+            if not name or unicodedata.category(char).startswith("C"):
+                continue
+            if not _looks_like_emoji_name(name):
+                continue
+            emoji = f"{char}\ufe0f" if codepoint < 0x2B00 else char
+            if emoji not in seen:
+                seen.add(emoji)
+                choices.append(emoji)
+    return tuple(choices)
+
+
+def _looks_like_emoji_name(name: str) -> bool:
+    keywords = (
+        "FACE",
+        "SMILING",
+        "GRINNING",
+        "CAT",
+        "MONKEY",
+        "HEART",
+        "HAND",
+        "PERSON",
+        "MAN",
+        "WOMAN",
+        "BABY",
+        "BODY",
+        "ANIMAL",
+        "BIRD",
+        "FISH",
+        "PLANT",
+        "FLOWER",
+        "TREE",
+        "FOOD",
+        "DRINK",
+        "FRUIT",
+        "VEGETABLE",
+        "SPORT",
+        "BALL",
+        "GAME",
+        "MUSIC",
+        "VEHICLE",
+        "CAR",
+        "BUS",
+        "TRAIN",
+        "AIRPLANE",
+        "SHIP",
+        "BUILDING",
+        "HOUSE",
+        "OBJECT",
+        "SYMBOL",
+        "SIGN",
+        "MARK",
+        "BUTTON",
+        "ARROW",
+        "STAR",
+        "MOON",
+        "SUN",
+        "CLOUD",
+        "FIRE",
+        "WARNING",
+        "CHECK",
+        "CROSS",
+        "CIRCLE",
+        "SQUARE",
+        "DIAMOND",
+        "TRIANGLE",
+    )
+    return any(keyword in name for keyword in keywords)
+
+
+def _chat_line(style: str, text: str, timestamp: Optional[float] = None, selected: bool = False) -> str:
+    if selected:
+        return f"[cyan bold]{_chat_time(timestamp)}[/cyan bold] [{style} bold]{escape(text)}[/{style} bold]"
+    return f"[cyan]{_chat_time(timestamp)}[/cyan] [{style}]{escape(text)}[/{style}]"
+
+
+def _chat_time(timestamp: Optional[float] = None) -> str:
+    if timestamp is None:
+        return datetime.now().strftime("%H:%M")
+    return datetime.fromtimestamp(timestamp).strftime("%H:%M")
+
+
+def _quote_text(text: str, max_length: int = 72) -> str:
+    one_line = " ".join(text.split())
+    if len(one_line) <= max_length:
+        return one_line
+    return one_line[: max_length - 3].rstrip() + "..."
 
 
 def _format_chat_transfer_message(snapshot: TransferSnapshot) -> str:

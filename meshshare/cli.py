@@ -24,8 +24,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--packet-delay",
         type=float,
-        default=1.1,
-        help="Delay between outgoing packets in seconds. Default: 1.1",
+        default=1.0,
+        help="Delay between outgoing packets in seconds. Default: 1.0",
     )
     return parser
 

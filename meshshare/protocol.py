@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import secrets
+import lzma
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Literal, Union
@@ -19,6 +20,22 @@ MAX_FILENAME_BYTES = 128
 MAX_SHA256_B64_LEN = 43
 
 BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
+COMPACT_PROTOCOL_BITS = 0b01
+COMPACT_RESERVED_BITS = 0b00
+FRAME_KIND_CODES = {
+    "S": 0b0000,
+    "M": 0b0001,
+    "A": 0b0010,
+    "Y": 0b0011,
+    "R": 0b0100,
+    "Q": 0b0101,
+    "Z": 0b0110,
+    "C": 0b1000,
+    "N": 0b1100,
+    "D": 0b1101,
+    "E": 0b1111,
+}
+FRAME_CODES_KIND = {code: kind for kind, code in FRAME_KIND_CODES.items()}
 
 
 class ProtocolError(ValueError):
@@ -32,6 +49,9 @@ class TransferMetadata:
     total: int
     chunk: int
     sha256: str
+    compression: str = "none"
+    original_size: int = 0
+    original_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -102,6 +122,26 @@ class ErrorFrame:
     message: str
 
 
+@dataclass(frozen=True)
+class SyncRequestFrame:
+    kind: Literal["Q"]
+    session_id: str
+    sent: int
+    total: int
+    nonce: str
+
+
+@dataclass(frozen=True)
+class SyncStateFrame:
+    kind: Literal["Z"]
+    session_id: str
+    received: int
+    first_missing: int
+    last_received: int
+    missing: tuple[int, ...]
+    nonce: str
+
+
 Frame = Union[
     MetaFrame,
     DataFrame,
@@ -112,6 +152,8 @@ Frame = Union[
     StopFrame,
     CompleteFrame,
     ErrorFrame,
+    SyncRequestFrame,
+    SyncStateFrame,
 ]
 
 
@@ -173,14 +215,76 @@ def ensure_frame_size(frame: str, max_bytes: int = MAX_FRAME_BYTES) -> str:
     return frame
 
 
-def make_metadata(file_path: Path, data: bytes, chunk_size: int) -> TransferMetadata:
+def frame_header(kind: str) -> str:
+    try:
+        code = FRAME_KIND_CODES[kind]
+    except KeyError as exc:
+        raise ProtocolError(f"unknown frame kind: {kind}") from exc
+    value = (COMPACT_PROTOCOL_BITS << 6) | (code << 2) | COMPACT_RESERVED_BITS
+    return f"{value:02x}"
+
+
+def is_protocol_like(text: str) -> bool:
+    if text.startswith(f"{PREFIX}|"):
+        return True
+    token = text.split("|", 1)[0]
+    return _compact_kind(token) is not None
+
+
+def compress_payload(data: bytes) -> tuple[bytes, str]:
+    if not data:
+        return data, "none"
+    compressed = lzma.compress(data, format=lzma.FORMAT_XZ, preset=9 | lzma.PRESET_EXTREME)
+    if len(compressed) >= len(data):
+        return data, "none"
+    return compressed, "xz"
+
+
+def decompress_payload(data: bytes, metadata: TransferMetadata, memlimit: int = 256 * 1024 * 1024) -> bytes:
+    if metadata.compression == "none":
+        restored = data
+    elif metadata.compression == "xz":
+        try:
+            restored = lzma.decompress(data, format=lzma.FORMAT_XZ, memlimit=memlimit)
+        except lzma.LZMAError as exc:
+            raise ProtocolError("invalid compressed payload") from exc
+    else:
+        raise ProtocolError(f"unsupported compression: {metadata.compression}")
+
+    expected_size = metadata_original_size(metadata)
+    expected_hash = metadata_original_sha256(metadata)
+    if len(restored) != expected_size or sha256_b64(restored) != expected_hash:
+        raise ProtocolError("decompressed payload checksum mismatch")
+    return restored
+
+
+def metadata_original_size(metadata: TransferMetadata) -> int:
+    return metadata.original_size or metadata.size
+
+
+def metadata_original_sha256(metadata: TransferMetadata) -> str:
+    return metadata.original_sha256 or metadata.sha256
+
+
+def make_metadata(
+    file_path: Path,
+    data: bytes,
+    chunk_size: int,
+    *,
+    original_data: bytes | None = None,
+    compression: str = "none",
+) -> TransferMetadata:
     total = math.ceil(len(data) / chunk_size) if data else 1
+    original = data if original_data is None else original_data
     return TransferMetadata(
         name=file_path.name,
         size=len(data),
         total=total,
         chunk=chunk_size,
         sha256=sha256_b64(data),
+        compression=compression,
+        original_size=len(original),
+        original_sha256=sha256_b64(original),
     )
 
 
@@ -189,13 +293,16 @@ def encode_metadata_frames(
     metadata: TransferMetadata,
     max_bytes: int = MAX_FRAME_BYTES,
 ) -> list[str]:
+    metadata_dict = asdict(metadata)
+    metadata_dict["original_size"] = metadata_original_size(metadata)
+    metadata_dict["original_sha256"] = metadata_original_sha256(metadata)
     meta_json = json.dumps(
-        asdict(metadata),
+        metadata_dict,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
     payload = b64_encode(meta_json)
-    header_budget = len(f"{PREFIX}|M|{session_id}|999|999|".encode("utf-8"))
+    header_budget = len(f"{frame_header('M')}|{session_id}|999|999|".encode("utf-8"))
     payload_budget = max_bytes - header_budget
     if payload_budget < 12:
         raise ProtocolError("metadata frame budget is too small")
@@ -206,7 +313,7 @@ def encode_metadata_frames(
 
     frames = [
         ensure_frame_size(
-            f"{PREFIX}|M|{session_id}|{to_base36(index)}|{to_base36(len(parts))}|{part}",
+            f"{frame_header('M')}|{session_id}|{to_base36(index)}|{to_base36(len(parts))}|{part}",
             max_bytes,
         )
         for index, part in enumerate(parts)
@@ -235,15 +342,24 @@ def decode_metadata(frames: Iterable[MetaFrame]) -> TransferMetadata:
             total=int(data["total"]),
             chunk=int(data["chunk"]),
             sha256=str(data["sha256"]),
+            compression=str(data.get("compression", "none")),
+            original_size=int(data.get("original_size", data["size"])),
+            original_sha256=str(data.get("original_sha256", data["sha256"])),
         )
     except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise ProtocolError("invalid metadata payload") from exc
     if metadata.size < 0 or metadata.total < 1 or metadata.chunk < MIN_RAW_CHUNK_BYTES:
         raise ProtocolError("invalid metadata values")
+    if metadata.original_size < 0:
+        raise ProtocolError("invalid original size")
+    if metadata.compression not in {"none", "xz"}:
+        raise ProtocolError("unsupported compression")
     if len(metadata.name.encode("utf-8")) > MAX_FILENAME_BYTES:
         raise ProtocolError("filename is too long")
     if len(metadata.sha256) != MAX_SHA256_B64_LEN:
         raise ProtocolError("invalid sha256 length")
+    if len(metadata.original_sha256) != MAX_SHA256_B64_LEN:
+        raise ProtocolError("invalid original sha256 length")
     expected_total = math.ceil(metadata.size / metadata.chunk) if metadata.size else 1
     if metadata.total != expected_total:
         raise ProtocolError("invalid chunk count")
@@ -257,7 +373,7 @@ def encode_data_frame(
     max_bytes: int = MAX_FRAME_BYTES,
 ) -> str:
     frame = (
-        f"{PREFIX}|D|{session_id}|{to_base36(index)}|"
+        f"{frame_header('D')}|{session_id}|{to_base36(index)}|"
         f"{crc32_hex(chunk)}|{b64_encode(chunk)}"
     )
     return ensure_frame_size(frame, max_bytes)
@@ -273,31 +389,58 @@ def decode_data_payload(frame: DataFrame) -> bytes:
 
 def encode_ack_frame(session_id: str, verified: int, total: int) -> str:
     return ensure_frame_size(
-        f"{PREFIX}|A|{session_id}|{to_base36(verified)}|{to_base36(total)}"
+        f"{frame_header('A')}|{session_id}|{to_base36(verified)}|{to_base36(total)}"
     )
 
 
 def encode_accept_frame(session_id: str) -> str:
-    return ensure_frame_size(f"{PREFIX}|Y|{session_id}")
+    return ensure_frame_size(f"{frame_header('Y')}|{session_id}")
 
 
 def encode_decline_frame(session_id: str, message: str = "declined") -> str:
     payload = b64_encode(message.encode("utf-8"))
-    return ensure_frame_size(f"{PREFIX}|N|{session_id}|{payload}")
+    return ensure_frame_size(f"{frame_header('N')}|{session_id}|{payload}")
 
 
 def encode_stop_frame(session_id: str, reason: str = "stopped") -> str:
     payload = b64_encode(reason.encode("utf-8"))
-    return ensure_frame_size(f"{PREFIX}|S|{session_id}|{payload}")
+    return ensure_frame_size(f"{frame_header('S')}|{session_id}|{payload}")
 
 
 def encode_complete_frame(session_id: str, sha256: str) -> str:
-    return ensure_frame_size(f"{PREFIX}|C|{session_id}|{sha256}")
+    return ensure_frame_size(f"{frame_header('C')}|{session_id}|{sha256}")
 
 
 def encode_error_frame(session_id: str, code: str, message: str) -> str:
     payload = b64_encode(message.encode("utf-8"))
-    return ensure_frame_size(f"{PREFIX}|E|{session_id}|{code}|{payload}")
+    return ensure_frame_size(f"{frame_header('E')}|{session_id}|{code}|{payload}")
+
+
+def encode_sync_request_frame(session_id: str, sent: int, total: int, nonce: str) -> str:
+    return ensure_frame_size(
+        f"{frame_header('Q')}|{session_id}|{to_base36(sent)}|{to_base36(total)}|{nonce}"
+    )
+
+
+def encode_sync_state_frame(
+    session_id: str,
+    received: int,
+    first_missing: int,
+    last_received: int,
+    missing: Iterable[int],
+    nonce: str,
+    max_bytes: int = MAX_FRAME_BYTES,
+) -> str:
+    prefix = (
+        f"{frame_header('Z')}|{session_id}|{to_base36(received)}|"
+        f"{to_base36(first_missing)}|{to_base36(last_received)}|"
+    )
+    suffix = f"|{nonce}"
+    spec = ",".join(range_tokens(missing)) or "-"
+    if frame_len(prefix + spec + suffix) <= max_bytes:
+        return ensure_frame_size(prefix + spec + suffix, max_bytes)
+    fallback = _range_token(first_missing, last_received) if first_missing >= 0 and last_received >= first_missing else "-"
+    return ensure_frame_size(prefix + fallback + suffix, max_bytes)
 
 
 def range_tokens(indices: Iterable[int]) -> list[str]:
@@ -351,7 +494,7 @@ def encode_resend_frames(
 ) -> list[str]:
     frames: list[str] = []
     current = ""
-    prefix = f"{PREFIX}|R|{session_id}|"
+    prefix = f"{frame_header('R')}|{session_id}|"
     for token in range_tokens(indices):
         candidate = token if not current else f"{current},{token}"
         if frame_len(prefix + candidate) <= max_bytes:
@@ -370,6 +513,7 @@ def encode_resend_frames(
 def parse_frame(text: str) -> Frame:
     if frame_len(text) > MAX_FRAME_BYTES:
         raise ProtocolError("frame is too large")
+    text = _normalize_frame_text(text)
     if not text.startswith(f"{PREFIX}|"):
         raise ProtocolError("not a MeshShare frame")
 
@@ -423,7 +567,51 @@ def parse_frame(text: str) -> Frame:
         if len(parts) != 5:
             raise ProtocolError("invalid error frame")
         return ErrorFrame("E", parts[2], parts[3], b64_decode(parts[4]).decode("utf-8", "replace"))
+    if kind == "Q":
+        parts = text.split("|", 5)
+        if len(parts) != 6:
+            raise ProtocolError("invalid sync request frame")
+        return SyncRequestFrame("Q", parts[2], from_base36(parts[3]), from_base36(parts[4]), parts[5])
+    if kind == "Z":
+        parts = text.split("|", 7)
+        if len(parts) != 8:
+            raise ProtocolError("invalid sync state frame")
+        missing = tuple() if parts[6] == "-" else parse_range_spec(parts[6])
+        return SyncStateFrame(
+            "Z",
+            parts[2],
+            from_base36(parts[3]),
+            from_base36(parts[4]),
+            from_base36(parts[5]),
+            missing,
+            parts[7],
+        )
     raise ProtocolError(f"unknown frame kind: {kind}")
+
+
+def _normalize_frame_text(text: str) -> str:
+    if text.startswith(f"{PREFIX}|"):
+        return text
+    token, separator, rest = text.partition("|")
+    if not separator:
+        raise ProtocolError("not a MeshShare frame")
+    kind = _compact_kind(token)
+    if kind is None:
+        raise ProtocolError("not a MeshShare frame")
+    return f"{PREFIX}|{kind}|{rest}"
+
+
+def _compact_kind(token: str) -> str | None:
+    if len(token) != 2:
+        return None
+    try:
+        value = int(token, 16)
+    except ValueError:
+        return None
+    if value >> 6 != COMPACT_PROTOCOL_BITS:
+        return None
+    code = (value >> 2) & 0b1111
+    return FRAME_CODES_KIND.get(code)
 
 
 def split_chunks(data: bytes, chunk_size: int = DEFAULT_RAW_CHUNK_BYTES) -> list[bytes]:

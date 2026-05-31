@@ -4,8 +4,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from meshtastic import mesh_pb2
+from meshshare.app import ChatRecord, MeshShareApp
+from meshshare.app import _format_device_status, _format_reactions, _line_with_reactions, _system_emoji_choices
 from meshshare.settings import SavedSettings
-from meshshare.transport import _send_traceroute_with_result, parse_tcp_endpoint
+from meshshare.transport import (
+    ChannelInfo,
+    LocalNodeStatus,
+    MeshtasticTransport,
+    _send_traceroute_with_result,
+    parse_tcp_endpoint,
+)
 
 
 class TransportSettingsTests(unittest.TestCase):
@@ -83,6 +91,158 @@ class TracerouteFormattingTests(unittest.TestCase):
             result.rx,
             "Our Node <- Hop A (3.5 dB) <- Hop B (4.0 dB) <- Peer (4.5 dB)",
         )
+
+
+class MessageMetadataTests(unittest.TestCase):
+    def test_receive_text_extracts_reply_reaction_and_timestamp(self):
+        messages = []
+        transport = MeshtasticTransport(on_message=messages.append)
+
+        transport._on_receive(
+            {
+                "decoded": {
+                    "text": "reply",
+                    "replyId": 101,
+                    "emoji": ord("\U0001f44d"),
+                },
+                "from": 55,
+                "fromId": "!00000037",
+                "id": 202,
+                "rxTime": 1_700_000_000,
+                "channel": 3,
+            }
+        )
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].reply_id, 101)
+        self.assertEqual(messages[0].emoji, "\U0001f44d")
+        self.assertEqual(messages[0].timestamp, 1_700_000_000)
+        self.assertEqual(messages[0].packet_id, 202)
+
+    def test_receive_reaction_without_text_payload(self):
+        messages = []
+        transport = MeshtasticTransport(on_message=messages.append)
+
+        transport._on_receive(
+            {
+                "decoded": {
+                    "replyId": 101,
+                    "emoji": ord("\U0001f44d"),
+                },
+                "from": 55,
+                "fromId": "!00000037",
+                "id": 202,
+            }
+        )
+
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0].text, "")
+        self.assertEqual(messages[0].reply_id, 101)
+        self.assertEqual(messages[0].emoji, "\U0001f44d")
+
+    def test_send_text_returns_packet_id(self):
+        class FakeInterface:
+            def __init__(self):
+                self.reply_id = None
+
+            def sendText(self, text, destinationId, wantAck, channelIndex, replyId=None):
+                self.reply_id = replyId
+                return SimpleNamespace(id=303)
+
+        transport = MeshtasticTransport()
+        interface = FakeInterface()
+        transport.interface = interface
+
+        self.assertEqual(transport.send_text("hello", "^all", reply_id=101), 303)
+        self.assertEqual(interface.reply_id, 101)
+
+    def test_send_reaction_builds_text_message_emoji_packet(self):
+        class FakeInterface:
+            def __init__(self):
+                self.sent_packet = None
+
+            def _generatePacketId(self):
+                return 404
+
+            def _sendPacket(self, packet, destinationId, wantAck=False):
+                self.sent_packet = packet
+                return SimpleNamespace(id=packet.id)
+
+        interface = FakeInterface()
+        transport = MeshtasticTransport()
+        transport.interface = interface
+
+        self.assertEqual(transport.send_reaction("\U0001f44d", 101, "!peer", 2), 404)
+        self.assertEqual(interface.sent_packet.decoded.reply_id, 101)
+        self.assertEqual(interface.sent_packet.decoded.emoji, ord("\U0001f44d"))
+        self.assertEqual(interface.sent_packet.channel, 2)
+
+    def test_list_channels_reads_local_node_channels(self):
+        channel0 = SimpleNamespace(
+            index=0,
+            role=1,
+            settings=SimpleNamespace(name="Primary", psk=b"\x01"),
+        )
+        channel1 = SimpleNamespace(
+            index=1,
+            role=2,
+            settings=SimpleNamespace(name="secret", psk=b"abcd"),
+        )
+        transport = MeshtasticTransport()
+        transport.interface = SimpleNamespace(localNode=SimpleNamespace(channels=[channel1, channel0]))
+
+        self.assertEqual(
+            transport.list_channels(),
+            [
+                ChannelInfo(index=0, name="Primary", encrypted=False),
+                ChannelInfo(index=1, name="secret", encrypted=True),
+            ],
+        )
+
+
+class DeviceStatusTests(unittest.TestCase):
+    def test_powered_status_uses_powered_label(self):
+        class FakeTransport:
+            def get_local_status(self):
+                return LocalNodeStatus(
+                    name="Bench Node",
+                    battery_level=101,
+                    voltage=5.0,
+                    powered=True,
+                )
+
+        app = MeshShareApp(Path("temp"), 120, 1.1)
+        app.transport = FakeTransport()
+        app.connection_kind = "Serial"
+
+        self.assertEqual(app.device_status_text(), "Bench Node | Serial | [POWERED] 5.00V")
+
+    def test_device_status_truncates_name_before_connection_and_power(self):
+        status = _format_device_status("Very Long Meshtastic Node Name", "Bluetooth", "90% 4.05V", max_width=37)
+
+        self.assertEqual(status, "Very Long... | Bluetooth | 90% 4.05V")
+
+
+class EmojiPickerDataTests(unittest.TestCase):
+    def test_system_emoji_choices_are_grouped_and_large_enough(self):
+        emojis = _system_emoji_choices()
+
+        self.assertGreater(len(emojis), 500)
+        self.assertIn("\U0001f600", emojis[:32])
+        self.assertIn("\U0001f44d", emojis)
+
+
+class ReactionFormattingTests(unittest.TestCase):
+    def test_reactions_render_as_compact_suffix(self):
+        record = ChatRecord(sender="Peer", text="Ping", own=False)
+        record.reactions["\U0001f44d"] = 2
+        record.reactions["\U0001f643"] = 1
+        record.reactions["\U0001f601"] = 1
+
+        suffix = _format_reactions(record.reactions)
+
+        self.assertEqual(suffix, "2x\U0001f44d|1x\U0001f643|1x\U0001f601")
+        self.assertEqual(_line_with_reactions("<Peer>: Ping", record.reactions, width=20), "<Peer>: Ping 2x\U0001f44d|1x\U0001f643|1x\U0001f601")
 
 
 if __name__ == "__main__":
