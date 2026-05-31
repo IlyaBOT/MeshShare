@@ -4,13 +4,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from meshtastic import mesh_pb2
-from meshshare.app import ChatRecord, MeshShareApp
+from meshshare.app import ChatRecord, MainMenuScreen, MeshShareApp
 from meshshare.app import _format_device_status, _format_reactions, _line_with_reactions, _system_emoji_choices
 from meshshare.settings import SavedSettings
 from meshshare.transport import (
     ChannelInfo,
     LocalNodeStatus,
     MeshtasticTransport,
+    NodeTarget,
     _send_traceroute_with_result,
     parse_tcp_endpoint,
 )
@@ -221,6 +222,76 @@ class DeviceStatusTests(unittest.TestCase):
         status = _format_device_status("Very Long Meshtastic Node Name", "Bluetooth", "90% 4.05V", max_width=37)
 
         self.assertEqual(status, "Very Long... | Bluetooth | 90% 4.05V")
+
+
+class MainMenuNodeLoadingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initial_nodes_load_while_connection_dialog_is_active(self):
+        node = NodeTarget(destination="!00000002", node_id="!00000002", name="Peer")
+
+        class FakeTransport:
+            def is_connected(self):
+                return True
+
+            def get_local_status(self):
+                return LocalNodeStatus(name="Local")
+
+            def list_nodes(self):
+                return [node]
+
+            def close(self):
+                pass
+
+        app = MeshShareApp(Path("temp"), 120, 1.1)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.2)
+            screen = app.main_menu_screen()
+            self.assertIsNotNone(screen)
+            self.assertNotIsInstance(app.screen, MainMenuScreen)
+            assert screen is not None
+
+            app.transport = FakeTransport()
+            app.connection_kind = "Serial"
+            app.connected_node_name = "Local"
+            screen.apply_connection_state()
+            await pilot.pause(0.2)
+
+            self.assertEqual(screen.node_ids["node-0"], node)
+            self.assertTrue(app.nodes_loaded)
+
+    async def test_initial_node_load_retries_empty_first_result(self):
+        node = NodeTarget(destination="!00000002", node_id="!00000002", name="Peer")
+
+        class FakeTransport:
+            def __init__(self):
+                self.calls = 0
+
+            def is_connected(self):
+                return True
+
+            def get_local_status(self):
+                return LocalNodeStatus(name="Local")
+
+            def list_nodes(self):
+                self.calls += 1
+                return [] if self.calls == 1 else [node]
+
+            def close(self):
+                pass
+
+        app = MeshShareApp(Path("temp"), 120, 1.1)
+        async with app.run_test() as pilot:
+            await pilot.pause(0.2)
+            await pilot.press("escape")
+            screen = app.main_menu_screen()
+            assert screen is not None
+
+            app.transport = FakeTransport()
+            app.connection_kind = "Serial"
+            app.connected_node_name = "Local"
+            await screen.load_initial_nodes(attempts=2, delay_seconds=0)
+
+            self.assertEqual(screen.node_ids["node-0"], node)
+            self.assertTrue(app.nodes_loaded)
 
 
 class EmojiPickerDataTests(unittest.TestCase):

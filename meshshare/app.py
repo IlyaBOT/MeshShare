@@ -1566,6 +1566,7 @@ class MeshShareApp(App):
         self.sent_reaction_packet_ids: set[int] = set()
         self.nodes_loaded = False
         self.nodes_loading = False
+        self.nodes_generation = 0
 
     def on_mount(self) -> None:
         self.push_screen(MainMenuScreen())
@@ -1613,6 +1614,7 @@ class MeshShareApp(App):
         self.nodes_by_key.clear()
         self.nodes_loaded = False
         self.nodes_loading = False
+        self.nodes_generation += 1
         self._fatal_device_lost = False
         self.selected_node = None
         self.selected_file = None
@@ -1699,6 +1701,7 @@ class MeshShareApp(App):
         self.channel_index = 0
         self.nodes_loaded = False
         self.nodes_loading = False
+        self.nodes_generation += 1
         screen = self.main_menu_screen()
         if screen is not None:
             screen.write_chat("* device disconnected")
