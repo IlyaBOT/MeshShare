@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshshare"
+version = "0.1.0"
+description = "Tiny peer-to-peer file transfer over Meshtastic text packets."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "meshtastic>=2.6",
+    "textual>=0.80",
+]
+
+[project.scripts]
+meshshare = "meshshare.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["meshshare*"]

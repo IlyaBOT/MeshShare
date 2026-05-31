@@ -1,0 +1,67 @@
+Metadata-Version: 2.4
+Name: meshshare
+Version: 0.1.0
+Summary: Tiny peer-to-peer file transfer over Meshtastic text packets.
+Requires-Python: >=3.11
+Description-Content-Type: text/markdown
+Requires-Dist: meshtastic>=2.6
+Requires-Dist: textual>=0.80
+
+# MeshShare
+
+Tiny peer-to-peer file transfer over Meshtastic text packets.
+
+MeshShare uses compact text frames that stay under 200 UTF-8 bytes. File bytes are
+base64url encoded, split into chunks, checked with per-chunk CRC32, then checked
+again with a final SHA-256 digest. The receiver can request missing or corrupted
+chunks again.
+
+## Install
+
+```powershell
+python -m pip install -e .
+```
+
+## Run
+
+```powershell
+meshshare
+```
+
+or:
+
+```powershell
+python -m meshshare
+```
+
+The TUI can connect to a Meshtastic node over:
+
+- Serial, for example `COM3` on Windows or `/dev/ttyUSB0` on Linux. Empty value
+  lets Meshtastic try auto-detection.
+- Bluetooth LE, by name/address. Empty value scans for any Meshtastic BLE node.
+- TCP/IP, for example `192.168.1.25` or `192.168.1.25:4403`.
+
+Choose a destination node, choose a channel index, pick a file with the system
+file picker, then confirm the transfer.
+
+Received files are saved to `received/` by default.
+
+## Protocol Notes
+
+Frames use the `MS1` prefix and are sent with Meshtastic `sendText(...)`.
+
+- `M`: metadata, split if needed.
+- `D`: data chunk with CRC32.
+- `A`: receiver progress ACK.
+- `R`: receiver resend request for missing/corrupt chunks.
+- `C`: final completion ACK with SHA-256.
+- `E`: protocol/application error.
+
+This is intentionally conservative. It is not streaming yet, and it requires
+MeshShare to be running on both peers.
+
+## Tests
+
+```powershell
+python -m unittest discover -s tests
+```

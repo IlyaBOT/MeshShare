@@ -1,0 +1,17 @@
+README.md
+pyproject.toml
+meshshare/__init__.py
+meshshare/__main__.py
+meshshare/app.py
+meshshare/cli.py
+meshshare/file_dialog.py
+meshshare/file_transfer.py
+meshshare/protocol.py
+meshshare/transport.py
+meshshare.egg-info/PKG-INFO
+meshshare.egg-info/SOURCES.txt
+meshshare.egg-info/dependency_links.txt
+meshshare.egg-info/entry_points.txt
+meshshare.egg-info/requires.txt
+meshshare.egg-info/top_level.txt
+tests/test_protocol.py
