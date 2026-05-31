@@ -13,8 +13,11 @@ from meshshare.app import (
     _ble_pin_prompt_supported,
     _line_with_reactions,
     _looks_like_pairing_required,
+    _format_transfer_left,
+    _format_transfer_right,
     _system_emoji_choices,
 )
+from meshshare.file_transfer import TransferSnapshot
 from meshshare.settings import SavedSettings
 from meshshare.transport import (
     ChannelInfo,
@@ -476,6 +479,29 @@ class ReactionFormattingTests(unittest.TestCase):
 
         self.assertEqual(suffix, "2x\U0001f44d|1x\U0001f643|1x\U0001f601")
         self.assertEqual(_line_with_reactions("<Peer>: Ping", record.reactions, width=20), "<Peer>: Ping 2x\U0001f44d|1x\U0001f643|1x\U0001f601")
+
+
+class TransferPanelFormattingTests(unittest.TestCase):
+    def test_transfer_panel_splits_left_and_right_status(self):
+        snapshot = TransferSnapshot(
+            direction="send",
+            file_name="voicemessage.mp3",
+            file_size=65228,
+            total_chunks=539,
+            verified_chunks=80,
+            sent_chunks=166,
+            signal_db=7.0,
+            ping_ms=123.4,
+            elapsed_seconds=295,
+            eta_seconds=1078,
+        )
+
+        self.assertEqual(
+            _format_transfer_left(snapshot),
+            '"voicemessage.mp3"\nA: 80 / S: 166 / T: 539 packets',
+        )
+        self.assertIn("Signal: 7.0 dB", _format_transfer_right(snapshot))
+        self.assertIn("Ping: 123ms", _format_transfer_right(snapshot))
 
 
 if __name__ == "__main__":

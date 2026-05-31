@@ -22,6 +22,7 @@ MAX_SHA256_B64_LEN = 43
 BASE36_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyz"
 COMPACT_PROTOCOL_BITS = 0b01
 COMPACT_RESERVED_BITS = 0b00
+COMPACT_PING_FLAG = 0b10
 FRAME_KIND_CODES = {
     "S": 0b0000,
     "M": 0b0001,
@@ -70,6 +71,7 @@ class DataFrame:
     index: int
     crc32: str
     payload: str
+    ping: bool = False
 
 
 @dataclass(frozen=True)
@@ -78,6 +80,7 @@ class AckFrame:
     session_id: str
     verified: int
     total: int
+    ping_index: int | None = None
 
 
 @dataclass(frozen=True)
@@ -215,12 +218,14 @@ def ensure_frame_size(frame: str, max_bytes: int = MAX_FRAME_BYTES) -> str:
     return frame
 
 
-def frame_header(kind: str) -> str:
+def frame_header(kind: str, flags: int = COMPACT_RESERVED_BITS) -> str:
     try:
         code = FRAME_KIND_CODES[kind]
     except KeyError as exc:
         raise ProtocolError(f"unknown frame kind: {kind}") from exc
-    value = (COMPACT_PROTOCOL_BITS << 6) | (code << 2) | COMPACT_RESERVED_BITS
+    if flags < 0 or flags > 0b11:
+        raise ProtocolError("compact frame flags must fit in two bits")
+    value = (COMPACT_PROTOCOL_BITS << 6) | (code << 2) | flags
     return f"{value:02x}"
 
 
@@ -376,9 +381,11 @@ def encode_data_frame(
     index: int,
     chunk: bytes,
     max_bytes: int = MAX_FRAME_BYTES,
+    ping: bool = False,
 ) -> str:
+    flags = COMPACT_PING_FLAG if ping else COMPACT_RESERVED_BITS
     frame = (
-        f"{frame_header('D')}|{session_id}|{to_base36(index)}|"
+        f"{frame_header('D', flags=flags)}|{session_id}|{to_base36(index)}|"
         f"{crc32_hex(chunk)}|{b64_encode(chunk)}"
     )
     return ensure_frame_size(frame, max_bytes)
@@ -392,10 +399,11 @@ def decode_data_payload(frame: DataFrame) -> bytes:
     return data
 
 
-def encode_ack_frame(session_id: str, verified: int, total: int) -> str:
-    return ensure_frame_size(
-        f"{frame_header('A')}|{session_id}|{to_base36(verified)}|{to_base36(total)}"
-    )
+def encode_ack_frame(session_id: str, verified: int, total: int, ping_index: int | None = None) -> str:
+    frame = f"{frame_header('A')}|{session_id}|{to_base36(verified)}|{to_base36(total)}"
+    if ping_index is not None:
+        frame += f"|{to_base36(ping_index)}"
+    return ensure_frame_size(frame)
 
 
 def encode_accept_frame(session_id: str) -> str:
@@ -518,7 +526,7 @@ def encode_resend_frames(
 def parse_frame(text: str) -> Frame:
     if frame_len(text) > MAX_FRAME_BYTES:
         raise ProtocolError("frame is too large")
-    text = _normalize_frame_text(text)
+    text, flags = _normalize_frame_text(text)
     if not text.startswith(f"{PREFIX}|"):
         raise ProtocolError("not a MeshShare frame")
 
@@ -536,12 +544,20 @@ def parse_frame(text: str) -> Frame:
         parts = text.split("|", 5)
         if len(parts) != 6:
             raise ProtocolError("invalid data frame")
-        return DataFrame("D", parts[2], from_base36(parts[3]), parts[4].lower(), parts[5])
+        return DataFrame(
+            "D",
+            parts[2],
+            from_base36(parts[3]),
+            parts[4].lower(),
+            parts[5],
+            bool(flags & COMPACT_PING_FLAG),
+        )
     if kind == "A":
-        parts = text.split("|", 4)
-        if len(parts) != 5:
+        parts = text.split("|", 5)
+        if len(parts) not in {5, 6}:
             raise ProtocolError("invalid ack frame")
-        return AckFrame("A", parts[2], from_base36(parts[3]), from_base36(parts[4]))
+        ping_index = from_base36(parts[5]) if len(parts) == 6 else None
+        return AckFrame("A", parts[2], from_base36(parts[3]), from_base36(parts[4]), ping_index)
     if kind == "R":
         parts = text.split("|", 3)
         if len(parts) != 4:
@@ -594,19 +610,25 @@ def parse_frame(text: str) -> Frame:
     raise ProtocolError(f"unknown frame kind: {kind}")
 
 
-def _normalize_frame_text(text: str) -> str:
+def _normalize_frame_text(text: str) -> tuple[str, int]:
     if text.startswith(f"{PREFIX}|"):
-        return text
+        return text, COMPACT_RESERVED_BITS
     token, separator, rest = text.partition("|")
     if not separator:
         raise ProtocolError("not a MeshShare frame")
-    kind = _compact_kind(token)
-    if kind is None:
+    compact = _compact_info(token)
+    if compact is None:
         raise ProtocolError("not a MeshShare frame")
-    return f"{PREFIX}|{kind}|{rest}"
+    kind, flags = compact
+    return f"{PREFIX}|{kind}|{rest}", flags
 
 
 def _compact_kind(token: str) -> str | None:
+    compact = _compact_info(token)
+    return None if compact is None else compact[0]
+
+
+def _compact_info(token: str) -> tuple[str, int] | None:
     if len(token) != 2:
         return None
     try:
@@ -616,7 +638,11 @@ def _compact_kind(token: str) -> str | None:
     if value >> 6 != COMPACT_PROTOCOL_BITS:
         return None
     code = (value >> 2) & 0b1111
-    return FRAME_CODES_KIND.get(code)
+    kind = FRAME_CODES_KIND.get(code)
+    if kind is None:
+        return None
+    flags = value & 0b11
+    return kind, flags
 
 
 def split_chunks(data: bytes, chunk_size: int = DEFAULT_RAW_CHUNK_BYTES) -> list[bytes]:

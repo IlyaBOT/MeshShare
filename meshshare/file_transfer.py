@@ -76,6 +76,7 @@ class TransferSnapshot:
     packets_sent: int = 0
     packets_received: int = 0
     signal_db: Optional[float] = None
+    ping_ms: Optional[float] = None
     elapsed_seconds: float = 0.0
     eta_seconds: Optional[float] = None
     message: str = ""
@@ -119,6 +120,8 @@ class OutgoingSession:
     error: Optional[str] = None
     resend_queue: "queue.Queue[tuple[int, ...]]" = field(default_factory=queue.Queue)
     sync_queue: "queue.Queue[SyncStateFrame]" = field(default_factory=queue.Queue)
+    ping_send_times: dict[int, float] = field(default_factory=dict)
+    ping_ms: Optional[float] = None
 
 
 @dataclass
@@ -138,6 +141,7 @@ class IncomingSession:
     packets_sent: int = 0
     packets_received: int = 0
     signal_db: Optional[float] = None
+    ping_ms: Optional[float] = None
     completed: bool = False
 
 
@@ -158,6 +162,7 @@ class FileTransferManager:
         offer_timeout: Optional[float] = None,
         sync_timeout: float = 5.0,
         sync_retries: int = 3,
+        ping_every: int = 3,
     ) -> None:
         self.transport = transport
         self.download_dir = download_dir
@@ -173,6 +178,7 @@ class FileTransferManager:
         self.offer_timeout = complete_timeout if offer_timeout is None else offer_timeout
         self.sync_timeout = sync_timeout
         self.sync_retries = sync_retries
+        self.ping_every = max(0, ping_every)
         self._lock = threading.RLock()
         self._outgoing: dict[str, OutgoingSession] = {}
         self._incoming: dict[str, IncomingSession] = {}
@@ -353,6 +359,7 @@ class FileTransferManager:
             outgoing.stop_event.set()
             outgoing.complete_event.set()
         elif frame.kind == "A":
+            self._update_ping_from_ack(outgoing, frame)
             outgoing.verified_chunks = max(outgoing.verified_chunks, frame.verified)
             self._emit_outgoing(outgoing, "sending", "Receiver verified chunks")
         elif frame.kind == "R":
@@ -472,10 +479,11 @@ class FileTransferManager:
         session.chunks[frame.index] = chunk_path
 
         received = len(session.chunks)
-        if received % self.ack_every == 0 or received == session.metadata.total:
+        ping_index = frame.index if frame.ping else None
+        if frame.ping or received % self.ack_every == 0 or received == session.metadata.total:
             self._send_to_session(
                 session,
-                encode_ack_frame(session.session_id, received, session.metadata.total),
+                encode_ack_frame(session.session_id, received, session.metadata.total, ping_index=ping_index),
             )
 
         if received == session.metadata.total:
@@ -592,7 +600,10 @@ class FileTransferManager:
     def _send_chunk(self, outgoing: OutgoingSession, index: int, resend: bool = False) -> None:
         self._raise_if_stopped(outgoing)
         started = time.monotonic()
-        frame = encode_data_frame(outgoing.session_id, index, outgoing.chunks[index])
+        ping = self._should_ping_chunk(outgoing, resend)
+        frame = encode_data_frame(outgoing.session_id, index, outgoing.chunks[index], ping=ping)
+        if ping:
+            outgoing.ping_send_times[index] = started
         self._send_frame(outgoing, frame)
         outgoing.sent_chunks = min(outgoing.metadata.total, outgoing.sent_chunks + (0 if resend else 1))
         outgoing.chunk_send_times.append(time.monotonic() - started)
@@ -635,6 +646,7 @@ class FileTransferManager:
                     continue
                 outgoing.verified_chunks = max(outgoing.verified_chunks, response.received)
                 ping_ms = int((time.monotonic() - started) * 1000)
+                outgoing.ping_ms = float(ping_ms)
                 if response.missing:
                     original_sent = outgoing.sent_chunks
                     outgoing.sent_chunks = min(outgoing.sent_chunks, response.first_missing + 1)
@@ -792,6 +804,7 @@ class FileTransferManager:
                 packets_sent=outgoing.packets_sent,
                 packets_received=outgoing.packets_received,
                 signal_db=outgoing.signal_db,
+                ping_ms=outgoing.ping_ms,
                 elapsed_seconds=elapsed,
                 eta_seconds=eta,
                 message=message,
@@ -824,6 +837,7 @@ class FileTransferManager:
                 packets_sent=session.packets_sent,
                 packets_received=session.packets_received,
                 signal_db=session.signal_db,
+                ping_ms=session.ping_ms,
                 elapsed_seconds=elapsed,
                 eta_seconds=eta,
                 message=message,
@@ -834,6 +848,19 @@ class FileTransferManager:
     def _emit(self, snapshot: TransferSnapshot) -> None:
         if self.on_snapshot is not None:
             self.on_snapshot(snapshot)
+
+    def _should_ping_chunk(self, outgoing: OutgoingSession, resend: bool) -> bool:
+        if resend or self.ping_every <= 0:
+            return False
+        return (outgoing.sent_chunks + 1) % self.ping_every == 0
+
+    def _update_ping_from_ack(self, outgoing: OutgoingSession, frame: AckFrame) -> None:
+        if frame.ping_index is None:
+            return
+        sent_at = outgoing.ping_send_times.pop(frame.ping_index, None)
+        if sent_at is None:
+            return
+        outgoing.ping_ms = max(0.0, (time.monotonic() - sent_at) * 1000)
 
 
 def signal_factor(snr: Optional[float]) -> float:

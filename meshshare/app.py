@@ -585,7 +585,6 @@ class MainMenuScreen(Screen):
                 with Vertical(id="chat-panel"):
                     yield Static("", id="chat-topic")
                     yield RichLog(id="chat-log", markup=True, wrap=True, highlight=False)
-                    yield Static("", id="transfer-message")
                 with Vertical(id="node-panel"):
                     yield Static("NODES", id="nodes-title")
                     yield OptionList(id="nodes")
@@ -594,13 +593,14 @@ class MainMenuScreen(Screen):
                 yield Input(placeholder="Type a message", id="message-input")
                 yield Static("Recipient: none", id="recipient-status")
             yield Static("RX: waiting for incoming file offer", id="receive-status")
-            yield ProgressBar(total=100, id="receive-progress")
-            yield Static("", id="receive-stats")
+            yield ProgressBar(total=100, show_eta=False, id="receive-progress")
+            with Horizontal(id="transfer-panel"):
+                yield Static("", id="transfer-info-left", markup=False)
+                yield Static("", id="transfer-info-right", markup=False)
 
     def on_mount(self) -> None:
         self._set_connected_state()
         self._hide_receive_progress()
-        self._hide_transfer_message()
         self._update_toolbar()
         self.set_transmitting(False)
         self.query_one("#message-input", Input).focus()
@@ -913,14 +913,21 @@ class MainMenuScreen(Screen):
 
     def show_receive_waiting(self, offer: IncomingOffer) -> None:
         metadata = offer.metadata
-        self.query_one("#receive-status", Static).display = True
+        self.query_one("#receive-status", Static).display = False
         self.query_one("#receive-progress", ProgressBar).display = True
-        self.query_one("#receive-stats", Static).display = True
-        self.query_one("#receive-status", Static).update(
-            f'Receiving "{metadata.name}" from {offer.sender}'
-        )
-        self.query_one("#receive-stats", Static).update(
-            f"File size: {format_bytes(metadata.size)}\nChunks: 0 / {metadata.total}"
+        self.query_one("#transfer-panel", Horizontal).display = True
+        self.query_one("#receive-progress", ProgressBar).update(progress=0)
+        self._update_transfer_panel(
+            TransferSnapshot(
+                direction="receive",
+                state="waiting",
+                file_name=metadata.name,
+                node_name=str(offer.sender),
+                file_size=metadata.original_size or metadata.size,
+                total_chunks=metadata.total,
+                signal_db=offer.signal_db,
+                message=f'Receiving "{metadata.name}" from {offer.sender}',
+            )
         )
 
     def clear_receive_waiting(self) -> None:
@@ -928,26 +935,25 @@ class MainMenuScreen(Screen):
         self._hide_receive_progress()
 
     def apply_receive_snapshot(self, snapshot: TransferSnapshot) -> None:
-        self.query_one("#receive-status", Static).display = True
+        self.query_one("#receive-status", Static).display = False
         self.query_one("#receive-progress", ProgressBar).display = True
-        self.query_one("#receive-stats", Static).display = True
+        self.query_one("#transfer-panel", Horizontal).display = True
         self.query_one("#receive-progress", ProgressBar).update(progress=snapshot.progress * 100)
-        self.query_one("#receive-status", Static).update(snapshot.message or snapshot.state)
-        self.query_one("#receive-stats", Static).update(_format_transfer_stats(snapshot))
+        self._update_transfer_panel(snapshot)
         if snapshot.state == "complete":
             self.write_chat(f"* received {snapshot.file_name}")
+            self.clear_receive_waiting()
+        elif snapshot.state in {"error", "stopped"}:
+            self.clear_receive_waiting()
 
     def apply_send_snapshot(self, snapshot: TransferSnapshot) -> None:
-        self.query_one("#receive-status", Static).display = True
+        self.query_one("#receive-status", Static).display = False
         self.query_one("#receive-progress", ProgressBar).display = True
-        self.query_one("#receive-stats", Static).display = True
+        self.query_one("#transfer-panel", Horizontal).display = True
         self.query_one("#receive-progress", ProgressBar).update(progress=snapshot.progress * 100)
-        self.query_one("#receive-status", Static).update(snapshot.message or snapshot.state)
-        self.query_one("#receive-stats", Static).update(_format_transfer_stats(snapshot))
-        self._update_transfer_message(snapshot)
+        self._update_transfer_panel(snapshot)
         if snapshot.state in {"complete", "error", "stopped"}:
             self.set_transmitting(False)
-            self._hide_transfer_message()
             self.clear_receive_waiting()
             if snapshot.state == "complete":
                 self.write_chat(f"* sent {snapshot.file_name} to {snapshot.node_name}")
@@ -955,15 +961,13 @@ class MainMenuScreen(Screen):
     def _hide_receive_progress(self) -> None:
         self.query_one("#receive-status", Static).display = False
         self.query_one("#receive-progress", ProgressBar).display = False
-        self.query_one("#receive-stats", Static).display = False
+        self.query_one("#transfer-panel", Horizontal).display = False
 
-    def _hide_transfer_message(self) -> None:
-        self.query_one("#transfer-message", Static).display = False
-
-    def _update_transfer_message(self, snapshot: TransferSnapshot) -> None:
-        transfer_message = self.query_one("#transfer-message", Static)
-        transfer_message.display = True
-        transfer_message.update(_format_chat_transfer_message(snapshot))
+    def _update_transfer_panel(self, snapshot: TransferSnapshot) -> None:
+        status = snapshot.message or snapshot.state
+        self.query_one("#receive-status", Static).update(status)
+        self.query_one("#transfer-info-left", Static).update(_format_transfer_left(snapshot))
+        self.query_one("#transfer-info-right", Static).update(_format_transfer_right(snapshot))
 
     def _set_connected_state(self) -> None:
         status = self.query_one("#device-status", Static)
@@ -1357,14 +1361,6 @@ class MeshShareApp(App):
         background-tint: transparent;
     }
 
-    #transfer-message {
-        height: 4;
-        padding: 0 1;
-        border-top: solid #66ff66;
-        color: #33dddd;
-        background: #000000;
-    }
-
     #node-panel {
         width: 34;
         height: 100%;
@@ -1454,17 +1450,58 @@ class MeshShareApp(App):
     }
 
     #receive-status {
-        height: 3;
-        padding: 1;
-        border: solid #66ff66;
-        margin-top: 1;
+        height: 1;
+        display: none;
     }
 
-    #receive-stats {
-        height: 7;
+    #receive-progress {
+        height: 3;
+        border: solid #66ff66;
         padding: 1;
+        margin-top: 1;
+        background: #000000;
+        color: #66ff66;
+    }
+
+    #receive-progress Bar {
+        width: 1fr;
+    }
+
+    #receive-progress Bar > .bar--bar {
+        color: #33dddd;
+        background: #202020;
+    }
+
+    #receive-progress Bar > .bar--complete {
+        color: #66ff66;
+        background: #202020;
+    }
+
+    #receive-progress PercentageStatus {
+        color: #66ff66;
+    }
+
+    #transfer-panel {
+        height: 4;
         border: solid #66ff66;
         margin-top: 1;
+        background: #000000;
+    }
+
+    #transfer-info-left {
+        width: 1fr;
+        height: 100%;
+        padding: 1;
+        color: #33dddd;
+        content-align: left middle;
+    }
+
+    #transfer-info-right {
+        width: 1fr;
+        height: 100%;
+        padding: 1;
+        color: #66ff66;
+        content-align: right middle;
     }
 
     #connect-dialog {
@@ -2024,18 +2061,43 @@ class MeshShareApp(App):
             self.transport.close()
 
 
-def _format_transfer_stats(snapshot: TransferSnapshot) -> str:
+def _format_transfer_left(snapshot: TransferSnapshot) -> str:
+    transieved = _snapshot_transieved_chunks(snapshot)
+    return (
+        f'"{snapshot.file_name or "file"}"\n'
+        f"A: {snapshot.verified_chunks} / S: {transieved} / T: {snapshot.total_chunks} packets"
+    )
+
+
+def _format_transfer_right(snapshot: TransferSnapshot) -> str:
     signal = "?" if snapshot.signal_db is None else f"{snapshot.signal_db:.1f} dB"
     eta = "?" if snapshot.eta_seconds is None else format_duration(snapshot.eta_seconds)
-    transieved = snapshot.sent_chunks if snapshot.direction == "send" else snapshot.received_chunks
+    verified_bytes = _snapshot_verified_bytes(snapshot)
     return (
-        f"Signal: {signal}\n"
-        f"File: {snapshot.file_name or '?'}\n"
-        f"File size: {format_bytes(snapshot.file_size)}\n"
-        f"Chunks: verified {snapshot.verified_chunks} / transieved {transieved} / total {snapshot.total_chunks}\n"
-        f"Elapsed / ETA: {format_duration(snapshot.elapsed_seconds)} / {eta}\n"
-        f"Packets sent / received: {snapshot.packets_sent} / {snapshot.packets_received}"
+        f"[{format_bytes(verified_bytes)} / {format_bytes(snapshot.file_size)}]   Signal: {signal}\n"
+        f"[{format_duration(snapshot.elapsed_seconds)}/~{eta}]   Ping: {_format_ping(snapshot.ping_ms)}"
     )
+
+
+def _snapshot_transieved_chunks(snapshot: TransferSnapshot) -> int:
+    return snapshot.sent_chunks if snapshot.direction == "send" else snapshot.received_chunks
+
+
+def _snapshot_verified_bytes(snapshot: TransferSnapshot) -> int:
+    total = max(snapshot.total_chunks, 1)
+    if snapshot.direction == "send":
+        chunks = snapshot.verified_chunks
+    else:
+        chunks = snapshot.received_chunks
+    return min(snapshot.file_size, round(snapshot.file_size * chunks / total))
+
+
+def _format_ping(ping_ms: Optional[float]) -> str:
+    if ping_ms is None:
+        return "?"
+    if ping_ms < 1000:
+        return f"{ping_ms:.0f}ms"
+    return f"{ping_ms / 1000:.1f}s"
 
 
 def _message_sender_keys(message) -> set[object]:
@@ -2238,26 +2300,6 @@ def _quote_text(text: str, max_length: int = 72) -> str:
     if len(one_line) <= max_length:
         return one_line
     return one_line[: max_length - 3].rstrip() + "..."
-
-
-def _format_chat_transfer_message(snapshot: TransferSnapshot) -> str:
-    total = max(snapshot.total_chunks, 1)
-    verified_bytes = min(snapshot.file_size, round(snapshot.file_size * snapshot.verified_chunks / total))
-    percent = round(snapshot.progress * 100)
-    bar = _progress_bar(snapshot.progress)
-    eta = "?" if snapshot.eta_seconds is None else format_duration(snapshot.eta_seconds)
-    return (
-        f'/"{snapshot.file_name or "file"}"/ {format_bytes(verified_bytes)} / {format_bytes(snapshot.file_size)}\n'
-        f"{bar} {percent}%\n"
-        f"{snapshot.verified_chunks}/{snapshot.sent_chunks}/{snapshot.total_chunks} packets | "
-        f"{format_duration(snapshot.elapsed_seconds)} / ~{eta}"
-    )
-
-
-def _progress_bar(progress: float, width: int = 28) -> str:
-    clamped = max(0.0, min(1.0, progress))
-    filled = round(clamped * width)
-    return "[" + ("#" * filled) + ("-" * (width - filled)) + "]"
 
 
 def _option_prompt_text(option: Option) -> str:

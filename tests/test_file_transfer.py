@@ -3,9 +3,10 @@ import unittest
 from pathlib import Path
 import time
 
-from meshshare.file_transfer import FileTransferManager, _same_sender
+from meshshare.file_transfer import FileTransferManager, OutgoingSession, _same_sender
 from meshshare.protocol import (
     encode_data_frame,
+    encode_ack_frame,
     encode_accept_frame,
     encode_sync_request_frame,
     encode_metadata_frames,
@@ -111,6 +112,65 @@ class FileTransferHandshakeTests(unittest.TestCase):
                 self.assertEqual(sync_frames[-1].received, 3)
                 self.assertEqual(sync_frames[-1].first_missing, 2)
                 self.assertEqual(sync_frames[-1].missing, (2,))
+            finally:
+                manager.close()
+
+    def test_receiver_returns_ping_ack_for_flagged_data_frame(self):
+        data = b"hello mesh"
+        session_id = "ping01"
+        metadata = make_metadata(Path("ping.txt"), data, 120)
+        transport = FakeTransport()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = FileTransferManager(
+                transport=transport,
+                download_dir=Path(temp_dir),
+                on_incoming_offer=lambda offer: True,
+            )
+            try:
+                for text in encode_metadata_frames(session_id, metadata):
+                    manager.handle_message(_message(text))
+                manager.handle_message(_message(encode_data_frame(session_id, 0, data, ping=True)))
+
+                ack_frames = [parse_frame(text) for text in transport.sent if parse_frame(text).kind == "A"]
+                self.assertTrue(ack_frames)
+                self.assertEqual(ack_frames[-1].ping_index, 0)
+            finally:
+                manager.close()
+
+    def test_sender_updates_ping_from_ack_report(self):
+        data = b"abcdefghijklmnopqrstuvwxyz" * 20
+        metadata = make_metadata(Path("ping.txt"), data, 120)
+        chunks = split_chunks(data, 120)
+        transport = FakeTransport()
+        target = type("Target", (), {
+            "destination": "!real",
+            "node_id": "!real",
+            "name": "real",
+            "snr": None,
+        })()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            manager = FileTransferManager(
+                transport=transport,
+                download_dir=Path(temp_dir),
+            )
+            try:
+                outgoing = OutgoingSession(
+                    session_id="ping01",
+                    path=Path("ping.txt"),
+                    target=target,
+                    channel_index=0,
+                    metadata=metadata,
+                    chunks=chunks,
+                    started_at=time.monotonic(),
+                )
+                outgoing.ping_send_times[2] = time.monotonic() - 0.05
+                manager._update_ping_from_ack(
+                    outgoing,
+                    parse_frame(encode_ack_frame("ping01", 3, len(chunks), ping_index=2)),
+                )
+
+                self.assertIsNotNone(outgoing.ping_ms)
+                self.assertGreater(outgoing.ping_ms, 0)
             finally:
                 manager.close()
 

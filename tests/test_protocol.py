@@ -9,6 +9,7 @@ from meshshare.protocol import (
     compress_payload,
     decompress_payload,
     encode_accept_frame,
+    encode_ack_frame,
     encode_data_frame,
     encode_decline_frame,
     encode_metadata_frames,
@@ -53,6 +54,23 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertTrue(compact.startswith("74|"))
         self.assertEqual(parse_frame(compact).kind, "D")
+        self.assertFalse(parse_frame(compact).ping)
+
+    def test_data_ping_flag_uses_reserved_compact_bit(self):
+        text = encode_data_frame("abc123", 2, b"hello", ping=True)
+        frame = parse_frame(text)
+
+        self.assertTrue(text.startswith("76|"))
+        self.assertEqual(frame.kind, "D")
+        self.assertTrue(frame.ping)
+
+    def test_ack_frame_can_report_ping_chunk(self):
+        frame = parse_frame(encode_ack_frame("abc123", 3, 10, ping_index=2))
+
+        self.assertEqual(frame.kind, "A")
+        self.assertEqual(frame.verified, 3)
+        self.assertEqual(frame.total, 10)
+        self.assertEqual(frame.ping_index, 2)
 
     def test_data_frames_fit_under_200_bytes_and_roundtrip(self):
         data = bytes(range(256)) * 3
