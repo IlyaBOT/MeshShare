@@ -1,0 +1,138 @@
+/*
+ * Copyright (c) 2026 Meshtastic LLC
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+package org.meshtastic.feature.messaging.ui.contact
+
+import androidx.lifecycle.SavedStateHandle
+import app.cash.turbine.test
+import dev.mokkery.MockMode
+import dev.mokkery.answering.returns
+import dev.mokkery.every
+import dev.mokkery.mock
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.test.UnconfinedTestDispatcher
+import kotlinx.coroutines.test.resetMain
+import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.test.setMain
+import org.meshtastic.core.model.ConnectionState
+import org.meshtastic.core.repository.ConnectionStateProvider
+import org.meshtastic.core.repository.PacketRepository
+import org.meshtastic.core.repository.RadioConfigRepository
+import org.meshtastic.core.testing.FakeNodeRepository
+import org.meshtastic.proto.ChannelSet
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertTrue
+
+@OptIn(ExperimentalCoroutinesApi::class)
+class ContactsViewModelTest {
+
+    private val testDispatcher = UnconfinedTestDispatcher()
+    private lateinit var viewModel: ContactsViewModel
+    private val nodeRepository = FakeNodeRepository()
+    private val packetRepository: PacketRepository = mock(MockMode.autofill)
+    private val radioConfigRepository: RadioConfigRepository = mock(MockMode.autofill)
+    private val connectionStateProvider: ConnectionStateProvider = mock(MockMode.autofill)
+
+    @BeforeTest
+    fun setUp() {
+        Dispatchers.setMain(testDispatcher)
+
+        every { connectionStateProvider.connectionState } returns MutableStateFlow(ConnectionState.Disconnected)
+        every { packetRepository.getUnreadCountTotal() } returns MutableStateFlow(0)
+        every { radioConfigRepository.channelSetFlow } returns MutableStateFlow(ChannelSet())
+
+        viewModel =
+            ContactsViewModel(
+                savedStateHandle = SavedStateHandle(),
+                nodeRepository = nodeRepository,
+                packetRepository = packetRepository,
+                radioConfigRepository = radioConfigRepository,
+                connectionStateProvider = connectionStateProvider,
+            )
+    }
+
+    @AfterTest
+    fun tearDown() {
+        Dispatchers.resetMain()
+    }
+
+    @Test
+    fun testInitialization() {
+        assertNotNull(viewModel)
+    }
+
+    @Test
+    fun `unreadCountTotal reflects updates from repository`() = runTest(testDispatcher) {
+        val countFlow = MutableStateFlow(0)
+        every { packetRepository.getUnreadCountTotal() } returns countFlow
+
+        // Re-init VM
+        viewModel =
+            ContactsViewModel(
+                SavedStateHandle(),
+                nodeRepository,
+                packetRepository,
+                radioConfigRepository,
+                connectionStateProvider,
+            )
+
+        viewModel.unreadCountTotal.test {
+            assertEquals(0, awaitItem())
+            countFlow.value = 5
+            assertEquals(5, awaitItem())
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
+    @Test
+    fun `toggleSectionCollapse flips section membership`() = runTest(testDispatcher) {
+        viewModel.collapsedSections.test {
+            assertEquals(emptySet(), awaitItem())
+
+            viewModel.toggleSectionCollapse(ContactSection.CHANNELS.key)
+            assertTrue(ContactSection.CHANNELS.key in awaitItem())
+
+            viewModel.toggleSectionCollapse(ContactSection.CHANNELS.key)
+            assertFalse(ContactSection.CHANNELS.key in awaitItem())
+
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+
+    @Test
+    fun `collapsedSections restores persisted state from SavedStateHandle`() = runTest(testDispatcher) {
+        viewModel =
+            ContactsViewModel(
+                SavedStateHandle(mapOf("collapsed_contact_sections" to ContactSection.DIRECT_MESSAGES.key)),
+                nodeRepository,
+                packetRepository,
+                radioConfigRepository,
+                connectionStateProvider,
+            )
+
+        viewModel.collapsedSections.test {
+            assertEquals(setOf(ContactSection.DIRECT_MESSAGES.key), awaitItem())
+            cancelAndIgnoreRemainingEvents()
+        }
+    }
+}
