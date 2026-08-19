@@ -1,2 +1,0 @@
-[console_scripts]
-meshshare = meshshare.cli:main

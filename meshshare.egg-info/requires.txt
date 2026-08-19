@@ -1,2 +1,0 @@
-meshtastic>=2.6
-textual>=0.80
