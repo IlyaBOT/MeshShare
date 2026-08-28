@@ -133,6 +133,7 @@
     <string name="backup_keys">Резервное копирование</string>
     <string name="backup_keys_confirmation">Сохранить публичные и приватные ключи в безопасном зашифрованном хранилище на этом устройстве.</string>
     <string name="backup_restore">Резервная копия и восстановление</string>
+    <string name="based_on_meshtastic_android">На основе Meshtastic Android</string>
     <string name="bad">Плохой</string>
     <!-- BANDWIDTH -->
     <string name="bandwidth">Ширина канала</string>
@@ -1081,6 +1082,10 @@
     <string name="mesh_beacon_targets">Цели передачи</string>
     <string name="mesh_map_location">Карта расположения нод</string>
     <string name="mesh_map_location_description">Включает синюю точку местоположения для вашего телефона на карте нод.</string>
+    <string name="meshshare_app_name">MeshShare</string>
+    <string name="meshshare_desktop_tray_tooltip">MeshShare</string>
+    <string name="meshshare_desktop_update_available_message">Версия MeshShare %1$s готова к загрузке.</string>
+    <string name="meshshare_version">Версия MeshShare</string>
     <!-- MESHTASTIC -->
     <string name="meshtastic">Meshtastic</string>
     <string name="meshtastic_alerts_notifications">Служебные уведомления</string>
@@ -1871,6 +1876,7 @@
     <string name="updated">Обновлено</string>
     <string name="uplink_enabled">MQTT Uplink включён</string>
     <string name="uplink_feature_description">Сообщения из сети будут отправляться в публичный интернет через любую ноду настроенного шлюза.</string>
+    <string name="upstream_repository">Исходный проект Meshtastic Android</string>
     <string name="uptime">Аптайм</string>
     <!-- URL -->
     <string name="url">URL-адрес</string>
@@ -1910,6 +1916,8 @@
     <string name="waypoint_received">Принята путевая точка: %1$s</string>
     <string name="website">Веб-сайт</string>
     <string name="weight">Вес</string>
+    <string name="what_is_meshshare">Что такое MeshShare?</string>
+    <string name="what_is_meshshare_description">Совместимый с Meshtastic клиент для надёжной прямой передачи файлов между двумя узлами с сохранением обычного обмена сообщениями в mesh-сети.</string>
     <string name="what_is_meshtastic">Что такое Meshtastic?</string>
     <string name="what_is_meshtastic_description">Открытая, автономная, децентрализованная mesh-сеть, работающая на доступных маломощных радиоустройствах.</string>
     <!-- WIFI -->

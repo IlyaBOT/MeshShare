@@ -1,0 +1,26 @@
+name: MeshShare Debug APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "ci/debug-apk" ]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: meshshare-debug-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-debug-apk:
+    uses: ./.github/workflows/reusable-check.yml
+    with:
+      run_lint: false
+      run_screenshot_tests: false
+      run_unit_tests: false
+      run_android_build: true
+      run_coverage: false
+      run_desktop_builds: false
+      run_desktop_flatpak_src: false
+      upload_artifacts: true

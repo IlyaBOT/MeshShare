@@ -1,6 +1,6 @@
-# `:desktopApp` — Meshtastic Desktop
+# `:desktopApp` — MeshShare Desktop
 
-A Compose Desktop application target — the first full non-Android target for the shared KMP module graph. This module serves as:
+A Compose Desktop application target for MeshShare — the first full non-Android target for the shared KMP module graph. This module serves as:
 
 1. **First multi-target milestone** — Proves the KMP architecture supports real application targets beyond Android.
 2. **Build smoke-test** — Validates that all `core:*` KMP modules compile and link on a JVM Desktop target.

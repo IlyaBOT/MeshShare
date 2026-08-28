@@ -103,7 +103,7 @@ private object NotifyUrgency {
  * gracefully if the library cannot be loaded.
  */
 class LinuxNotificationSender(
-    private val appName: String = "Meshtastic",
+    private val appName: String = "MeshShare",
     private val desktopEntry: String = appName.lowercase(),
 ) : NativeNotificationSender,
     AutoCloseable {

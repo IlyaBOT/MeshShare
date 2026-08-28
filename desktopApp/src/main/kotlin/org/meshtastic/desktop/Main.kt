@@ -85,10 +85,11 @@ import org.meshtastic.core.repository.UiPrefs
 import org.meshtastic.core.resources.Res
 import org.meshtastic.core.resources.desktop_tray_quit
 import org.meshtastic.core.resources.desktop_tray_show
-import org.meshtastic.core.resources.desktop_tray_tooltip
-import org.meshtastic.core.resources.desktop_update_available_message
 import org.meshtastic.core.resources.desktop_update_available_title
 import org.meshtastic.core.resources.desktop_update_download
+import org.meshtastic.core.resources.meshshare_app_name
+import org.meshtastic.core.resources.meshshare_desktop_tray_tooltip
+import org.meshtastic.core.resources.meshshare_desktop_update_available_message
 import org.meshtastic.core.service.MeshServiceOrchestrator
 import org.meshtastic.core.ui.theme.AppTheme
 import org.meshtastic.core.ui.util.LocalEventBranding
@@ -104,7 +105,7 @@ import java.util.Locale
 import kotlin.system.exitProcess
 import coil3.util.Logger as CoilLogger
 
-/** Meshtastic Desktop — the first non-Android target for the shared KMP module graph. */
+/** MeshShare Desktop — the first non-Android target for the shared KMP module graph. */
 private const val MEMORY_CACHE_MAX_BYTES = 64L * 1024L * 1024L // 64 MiB
 private const val DISK_CACHE_MAX_BYTES = 32L * 1024L * 1024L // 32 MiB
 
@@ -136,7 +137,7 @@ fun main(args: Array<String>) {
         val koinApp = remember {
             // Keep console output and also capture into the in-memory buffer the Debug screen views/exports.
             Logger.setLogWriters(listOf(platformLogWriter(), InMemoryLogBuffer))
-            Logger.i { "Meshtastic Desktop — Starting" }
+            Logger.i { "MeshShare Desktop — Starting" }
             startKoin { modules(desktopPlatformModule(), desktopModule()) }
         }
         val systemLocale = remember { Locale.getDefault() }
@@ -152,7 +153,7 @@ fun main(args: Array<String>) {
     // release native handles — currently libnotify's process-wide state in LinuxNotificationSender. Guarded because
     // a teardown failure must not turn a clean quit into a non-zero exit.
     runCatching { stopKoin() }.onFailure { Logger.w(it) { "stopKoin() failed during shutdown" } }
-    Logger.i { "Meshtastic Desktop — Stopped" }
+    Logger.i { "MeshShare Desktop — Stopped" }
 
     // Restores the exit application() no longer performs. Not optional: lingering non-daemon threads (coroutine
     // dispatchers, ktor pools, AWT stragglers) would otherwise keep the JVM alive after the last window closes,
@@ -256,7 +257,7 @@ private fun ApplicationScope.MeshtasticDesktopApp(uiViewModel: UIViewModel, isDa
     Tray(
         state = trayState,
         icon = trayIcon,
-        tooltip = stringResource(Res.string.desktop_tray_tooltip),
+        tooltip = stringResource(Res.string.meshshare_desktop_tray_tooltip),
         onAction = { isAppVisible = true },
         menu = {
             updateInfo?.let { update ->
@@ -310,7 +311,7 @@ private fun rememberAvailableUpdate(notificationManager: DesktopNotificationMana
             notificationManager.dispatch(
                 Notification(
                     title = getString(Res.string.desktop_update_available_title),
-                    message = getString(Res.string.desktop_update_available_message, update.versionName),
+                    message = getString(Res.string.meshshare_desktop_update_available_message, update.versionName),
                     category = Notification.Category.Service,
                 ),
             )
@@ -381,7 +382,7 @@ private fun ApplicationScope.MeshtasticWindow(
 
     Window(
         onCloseRequest = onCloseRequest,
-        title = "Meshtastic Desktop",
+        title = stringResource(Res.string.meshshare_app_name),
         icon = appIcon,
         state = windowState,
         visible = visible,

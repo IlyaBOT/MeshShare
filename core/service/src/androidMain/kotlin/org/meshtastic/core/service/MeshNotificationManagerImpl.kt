@@ -83,8 +83,8 @@ import org.meshtastic.core.resources.local_stats_utilization
 import org.meshtastic.core.resources.low_battery_message
 import org.meshtastic.core.resources.low_battery_title
 import org.meshtastic.core.resources.mark_as_read
+import org.meshtastic.core.resources.meshshare_app_name
 import org.meshtastic.core.resources.meshtastic_alerts_notifications
-import org.meshtastic.core.resources.meshtastic_app_name
 import org.meshtastic.core.resources.meshtastic_broadcast_notifications
 import org.meshtastic.core.resources.meshtastic_low_battery_notifications
 import org.meshtastic.core.resources.meshtastic_low_battery_temporary_remote_notifications
@@ -443,7 +443,7 @@ class MeshNotificationManagerImpl(
         val title =
             when (snapshot.state) {
                 is ConnectionState.Connected ->
-                    getStringSuspend(Res.string.meshtastic_app_name) + ": " + getStringSuspend(Res.string.connected)
+                    getStringSuspend(Res.string.meshshare_app_name) + ": " + getStringSuspend(Res.string.connected)
 
                 is ConnectionState.Disconnected -> getStringSuspend(Res.string.disconnected)
 
@@ -587,7 +587,7 @@ class MeshNotificationManagerImpl(
         val messagingStyle =
             NotificationCompat.MessagingStyle(me)
                 .setGroupConversation(true)
-                .setConversationTitle(getStringSuspend(Res.string.meshtastic_app_name))
+                .setConversationTitle(getStringSuspend(Res.string.meshshare_app_name))
 
         activeNotifications.forEach { sbn ->
             // Prefer the child's real MessagingStyle: its latest message carries the actual sender (Person, icon) and

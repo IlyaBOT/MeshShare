@@ -141,6 +141,7 @@
     <string name="bandwidth_unsupported">Unsupported (%1$s)</string>
     <string name="bandwidth_unsupported_summary">This bandwidth is not supported by the connected radio in the selected region. Choose a supported value before saving.</string>
     <string name="baro_pressure">Baro</string>
+    <string name="based_on_meshtastic_android">Based on Meshtastic Android</string>
     <string name="battery">Battery</string>
     <string name="battery_ina_2xx_i2c_address">Battery INA_2XX I2C address</string>
     <string name="ble_devices">Bluetooth Devices</string>
@@ -1110,6 +1111,10 @@
     <string name="mesh_beacon_targets">Broadcast targets</string>
     <string name="mesh_map_location">Mesh Map Location</string>
     <string name="mesh_map_location_description">Enables the blue location dot for your phone in the mesh map.</string>
+    <string name="meshshare_app_name">MeshShare</string>
+    <string name="meshshare_desktop_tray_tooltip">MeshShare</string>
+    <string name="meshshare_desktop_update_available_message">MeshShare %1$s is ready to download.</string>
+    <string name="meshshare_version">MeshShare version</string>
     <!-- MESHTASTIC -->
     <string name="meshtastic">Meshtastic</string>
     <string name="meshtastic_alerts_notifications">Alert notifications</string>
@@ -1899,6 +1904,7 @@
     <string name="updated">Updated</string>
     <string name="uplink_enabled">MQTT Uplink Enabled</string>
     <string name="uplink_feature_description">Messages from the mesh will be sent to the public internet through any node's configured gateway.</string>
+    <string name="upstream_repository">Meshtastic Android upstream</string>
     <string name="uptime">Uptime</string>
     <!-- URL -->
     <string name="url">URL</string>
@@ -1939,6 +1945,8 @@
     <string name="waypoint_received">Received waypoint: %1$s</string>
     <string name="website">Website</string>
     <string name="weight">Weight</string>
+    <string name="what_is_meshshare">What is MeshShare?</string>
+    <string name="what_is_meshshare_description">A Meshtastic-compatible client focused on reliable, direct peer-to-peer file transfer while preserving normal mesh messaging.</string>
     <string name="what_is_meshtastic">What is Meshtastic?</string>
     <string name="what_is_meshtastic_description">An open source, off-grid, decentralized, mesh network that runs on affordable, low-power radios.</string>
     <!-- WIFI -->

@@ -55,17 +55,19 @@ import org.jetbrains.compose.resources.stringResource
 import org.meshtastic.core.resources.Res
 import org.meshtastic.core.resources.about
 import org.meshtastic.core.resources.acknowledgements
-import org.meshtastic.core.resources.app_version
 import org.meshtastic.core.resources.apps
+import org.meshtastic.core.resources.based_on_meshtastic_android
 import org.meshtastic.core.resources.copyright_notice
 import org.meshtastic.core.resources.documentation
 import org.meshtastic.core.resources.github_repository
+import org.meshtastic.core.resources.meshshare_version
 import org.meshtastic.core.resources.need_hardware
 import org.meshtastic.core.resources.need_hardware_description
 import org.meshtastic.core.resources.project_information
+import org.meshtastic.core.resources.upstream_repository
 import org.meshtastic.core.resources.website
-import org.meshtastic.core.resources.what_is_meshtastic
-import org.meshtastic.core.resources.what_is_meshtastic_description
+import org.meshtastic.core.resources.what_is_meshshare
+import org.meshtastic.core.resources.what_is_meshshare_description
 import org.meshtastic.core.ui.component.ListItem
 import org.meshtastic.core.ui.component.MainAppBar
 import org.meshtastic.core.ui.icon.ChevronRight
@@ -84,7 +86,8 @@ private val CAROUSEL_IMAGE_WIDTH = 110.dp
 private val CAROUSEL_IMAGE_HEIGHT = 130.dp
 
 private const val HARDWARE_URL = "https://meshtastic.org/#hardware"
-private const val GITHUB_REPO_URL = "https://github.com/meshtastic/Meshtastic-Android"
+private const val GITHUB_REPO_URL = "https://github.com/IlyaBOT/MeshShare"
+private const val MESHTASTIC_ANDROID_URL = "https://github.com/meshtastic/Meshtastic-Android"
 private const val WEBSITE_URL = "https://meshtastic.org"
 private const val DOCS_URL = "https://meshtastic.org/docs/getting-started"
 
@@ -102,8 +105,8 @@ private val POPULAR_DEVICES =
     )
 
 /**
- * About screen displaying general information about Meshtastic, hardware recommendations, repository and version
- * details, acknowledgements, and project links.
+ * About screen displaying MeshShare identity and version, Meshtastic attribution, hardware recommendations,
+ * acknowledgements, and project links.
  */
 @Composable
 fun AboutScreen(
@@ -136,12 +139,13 @@ fun AboutScreen(
                 .padding(horizontal = 16.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            WhatIsMeshtasticSection()
+            WhatIsMeshShareSection()
             AppsSection(
                 appVersionName = appVersionName,
                 onNavigateToAcknowledgements = onNavigateToAcknowledgements,
                 onOpenHardwareLink = { uriHandler.openUri(HARDWARE_URL) },
                 onOpenRepoLink = { uriHandler.openUri(GITHUB_REPO_URL) },
+                onOpenUpstreamLink = { uriHandler.openUri(MESHTASTIC_ANDROID_URL) },
             )
             ProjectInformationSection(
                 onOpenWebsite = { uriHandler.openUri(WEBSITE_URL) },
@@ -153,10 +157,10 @@ fun AboutScreen(
 }
 
 @Composable
-private fun WhatIsMeshtasticSection(modifier: Modifier = Modifier) {
-    ExpressiveSection(title = stringResource(Res.string.what_is_meshtastic), modifier = modifier) {
+private fun WhatIsMeshShareSection(modifier: Modifier = Modifier) {
+    ExpressiveSection(title = stringResource(Res.string.what_is_meshshare), modifier = modifier) {
         Text(
-            text = stringResource(Res.string.what_is_meshtastic_description),
+            text = stringResource(Res.string.what_is_meshshare_description),
             modifier = Modifier.padding(16.dp),
             style = MaterialTheme.typography.bodyLarge,
             color = MaterialTheme.colorScheme.onSurface,
@@ -170,6 +174,7 @@ private fun AppsSection(
     onNavigateToAcknowledgements: () -> Unit,
     onOpenHardwareLink: () -> Unit,
     onOpenRepoLink: () -> Unit,
+    onOpenUpstreamLink: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     ExpressiveSection(title = stringResource(Res.string.apps), modifier = modifier) {
@@ -181,10 +186,17 @@ private fun AppsSection(
             onClick = onOpenRepoLink,
         )
         ListItem(
-            text = stringResource(Res.string.app_version),
+            text = stringResource(Res.string.meshshare_version),
             leadingIcon = MeshtasticIcons.Memory,
             supportingText = appVersionName,
             trailingIcon = null,
+        )
+        ListItem(
+            text = stringResource(Res.string.based_on_meshtastic_android),
+            leadingIcon = MeshtasticIcons.Code,
+            supportingText = stringResource(Res.string.upstream_repository),
+            trailingIcon = MeshtasticIcons.ChevronRight,
+            onClick = onOpenUpstreamLink,
         )
         ListItem(
             text = stringResource(Res.string.acknowledgements),

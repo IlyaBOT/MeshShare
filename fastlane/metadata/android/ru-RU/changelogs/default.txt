@@ -1,1 +1,1 @@
-Подробные заметки о выпуске, пожалуйста, смотрите здесь: https://github.com/meshtastic/Meshtastic-Android/releases/
+Подробные заметки о выпуске: https://github.com/IlyaBOT/MeshShare/releases/

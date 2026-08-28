@@ -1,1 +1,1 @@
-Официальное приложение для Meshtastic, open-source, off-grid, mesh radio.
+Клиент Meshtastic с фокусом на прямую P2P-передачу файлов.

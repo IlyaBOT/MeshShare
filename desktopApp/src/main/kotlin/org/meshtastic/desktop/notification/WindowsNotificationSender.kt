@@ -29,7 +29,7 @@ private const val PROCESS_TIMEOUT_SECONDS = 5L
  * performed by PowerShell's XML parser — never through string interpolation in the script source. Title and message are
  * passed as PowerShell `-ArgumentList` parameters.
  */
-class WindowsNotificationSender(private val appName: String = "Meshtastic") : NativeNotificationSender {
+class WindowsNotificationSender(private val appName: String = "MeshShare") : NativeNotificationSender {
 
     override fun send(notification: Notification): Boolean = runCommand(buildCommand(notification))
 

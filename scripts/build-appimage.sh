@@ -68,7 +68,7 @@ if [ ! -f "$icon" ]; then
   exit 1
 fi
 
-# Desktop-entry id / output-name slug: "Meshtastic Desktop" -> meshtastic-desktop
+# Desktop-entry id / output-name slug: "MeshShare" -> meshshare
 slug="$(printf '%s' "$app_name" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')"
 
 # --- Assemble the AppDir ---
@@ -93,7 +93,7 @@ Type=Application
 Name=${app_name}
 Exec=AppRun
 Icon=${slug}
-Comment=Meshtastic Desktop Application
+Comment=MeshShare Meshtastic-compatible off-grid messaging client
 Categories=Network;
 Terminal=false
 EOF

@@ -6,14 +6,15 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
 
-  <name>Meshtastic Desktop</name>
-  <summary>Communicate off-grid with Meshtastic mesh radio devices</summary>
+  <name>MeshShare</name>
+  <summary>Meshtastic-compatible off-grid messaging client</summary>
 
   <description>
     <p>
-      Meshtastic is an open-source, off-grid mesh networking project that lets
-      you send messages and view node locations over long distances without
-      cellular service or the internet, using inexpensive LoRa radio hardware.
+      MeshShare is a Meshtastic-compatible client being developed around
+      reliable direct file transfer. Current builds preserve normal off-grid
+      messaging, node locations, and device management over inexpensive LoRa
+      radio hardware while the transfer workflow is completed and verified.
     </p>
     <p>Features include:</p>
     <ul>
@@ -29,13 +30,13 @@
 
   <launchable type="desktop-id">org.meshtastic.MeshtasticDesktop.desktop</launchable>
 
-  <developer id="org.meshtastic">
-    <name>Meshtastic LLC</name>
+  <developer id="io.github.ilyabot">
+    <name>MeshShare contributors</name>
   </developer>
 
-  <url type="homepage">https://meshtastic.org</url>
-  <url type="bugtracker">https://github.com/meshtastic/Meshtastic-Android/issues</url>
-  <url type="vcs-browser">https://github.com/meshtastic/Meshtastic-Android</url>
+  <url type="homepage">https://github.com/IlyaBOT/MeshShare</url>
+  <url type="bugtracker">https://github.com/IlyaBOT/MeshShare/issues</url>
+  <url type="vcs-browser">https://github.com/IlyaBOT/MeshShare</url>
   <url type="donation">https://opencollective.com/meshtastic</url>
   <url type="contribute">https://meshtastic.org/docs/contributing/</url>
 

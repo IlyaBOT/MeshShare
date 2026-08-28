@@ -2,7 +2,6 @@ name: Internal testing - Bug Report
 description: File a bug report.
 title: "[Bug]: "
 labels: [bug, ch_testing]
-projects: [meshtastic/Meshtastic-Android]
 body:
   - type: markdown
     attributes:
@@ -29,9 +28,9 @@ body:
         Bug reports that do not meet these criteria will be closed.
         Requests that do not meet these criteria will be closed.
         Links:
-          [**OPEN ISSUES**](https://github.com/meshtastic/Meshtastic-Android/issues)
-          [**CLOSED ISSUES**](https://github.com/meshtastic/Meshtastic-Android/issues?q=is%3Aissue+is%3Aclosed)
-          [Contribution Guidelines](https://github.com/meshtastic/Meshtastic-Android/blob/main/README.md#contributing)
+          [**OPEN ISSUES**](https://github.com/IlyaBOT/MeshShare/issues)
+          [**CLOSED ISSUES**](https://github.com/IlyaBOT/MeshShare/issues?q=is%3Aissue+is%3Aclosed)
+          [Contribution Guidelines](https://github.com/IlyaBOT/MeshShare/blob/main/CONTRIBUTING.md)
       options:
         - label: |
             I am able to reproduce the bug with the latest version.
@@ -60,7 +59,7 @@ body:
     attributes:
       label: Affected app version
       description: |
-        In which Meshtastic-Android app version did you encounter the bug?
+        In which MeshShare app version did you encounter the bug?
         Can be seen on the bottom of the `Settings` screen in the app.
       placeholder: "x.y.z-channel.x (build) flavor"
     validations:

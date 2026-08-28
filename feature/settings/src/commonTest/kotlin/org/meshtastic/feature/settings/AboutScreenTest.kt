@@ -21,6 +21,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.v2.runComposeUiTest
 import org.meshtastic.core.ui.theme.AppTheme
 import kotlin.test.Test
@@ -47,10 +48,11 @@ class AboutScreenTest {
         // Top app bar
         onNodeWithText("About").assertIsDisplayed()
 
-        // What is Meshtastic section
-        onNodeWithText("What is Meshtastic?").assertIsDisplayed()
+        // MeshShare identity
+        onNodeWithText("What is MeshShare?").assertIsDisplayed()
         onNodeWithText(
-            "An open source, off-grid, decentralized, mesh network that runs on affordable, low-power radios.",
+            "A Meshtastic-compatible client focused on reliable, direct peer-to-peer file transfer while " +
+                "preserving normal mesh messaging.",
         )
             .assertIsDisplayed()
 
@@ -63,8 +65,10 @@ class AboutScreenTest {
         )
             .assertIsDisplayed()
         onNodeWithText("GitHub Repository").assertIsDisplayed()
-        onNodeWithText("Version").assertIsDisplayed()
+        onNodeWithText("MeshShare version").assertIsDisplayed()
         onNodeWithText("2.5.0").assertIsDisplayed()
+        onNodeWithText("Based on Meshtastic Android").assertIsDisplayed()
+        onNodeWithText("Meshtastic Android upstream").assertIsDisplayed()
         onNodeWithText("Acknowledgements").assertIsDisplayed()
 
         // Project information section
@@ -73,9 +77,9 @@ class AboutScreenTest {
         onNodeWithText("Documentation").assertIsDisplayed()
 
         // Copyright footer
-        onNodeWithText("Meshtastic® Copyright Meshtastic LLC").assertIsDisplayed()
+        onNodeWithText("Meshtastic® Copyright Meshtastic LLC").performScrollTo().assertIsDisplayed()
 
-        onNodeWithText("Acknowledgements").performClick()
+        onNodeWithText("Acknowledgements").performScrollTo().performClick()
         assertTrue(navigatedToAcknowledgements)
 
         onNodeWithContentDescription("Navigate Back").performClick()

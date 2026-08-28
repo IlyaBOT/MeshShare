@@ -1,21 +1,14 @@
-Meshtastic является инструментом для использования Android-устройств с Mesh сетью с открытым исходным кодом. Это приложение является основным клиентом Meshtastic проекта, которое позволяет вам управлять вашими mesh устройствами и общаться с другими пользователями.
+MeshShare — совместимый с Meshtastic Android-клиент для надёжной прямой передачи файлов между двумя узлами в низкоскоростных автономных LoRa-сетях. Обычные сообщения Meshtastic, управление узлами и настройка радиоустройств остаются доступными.
 
-Для получения дополнительной информации о проекте Meshtastic, пожалуйста, посетите наш веб-сайт: <a href="https://www.meshtastic.org">meshtastic.org</a>. Прошивка узла радиосети, является отдельным проектом с открытым исходным кодом, который находится здесь: <a href="https://github.com/meshtastic/Meshtastic-device">https://github.com/meshtastic/Meshtastic-device</a>.
+Передача файлов MeshShare рассчитана на одного отправителя и одного конкретного получателя. Она недоступна в каналах, групповых чатах и при широковещательной отправке. Файлы разбиваются на небольшие радиопакеты с проверкой целостности, восстановлением потерь, повторной синхронизацией, бережным управлением скоростью и необязательным сжатием. Специальная прошивка Meshtastic не требуется.
 
-<b>Сообщество и поддержка</b>
+<b>Статус разработки</b>
 
-Этот проект находится в бета-версии. Нам интересно ваше мнение! Если у вас есть вопросы, обратная связь или проблемы, пожалуйста, присоединяйтесь к нашему дружному и активному сообществу:
+Переработка MeshShare продолжается. Передача файлов пока не готова для промышленного применения или критически важных сценариев. Для каждой тестовой версии отдельно фиксируются результаты сборки, автоматических тестов, эмулятора и проверки на реальных радиоустройствах.
 
-• <b>Форум для обсуждений:</b> <a href="https://github.com/orgs/meshtastic/discussions">https://github.com/orgs/meshtastic/discussions</a>
-• <b>Discord:</b> <a href="https://discord.gg/meshtastic">https://discord.gg/meshtastic</a>
-• <b>Сообщить о проблеме:</b> <a href="https://github.com/meshtastic/Meshtastic-Android/issues">https://github.com/meshtastic/Meshtastic-Android/issues</a>
+<b>Проект и поддержка</b>
 
-<b>Документация</b>
+• <b>Исходный код и задачи:</b> <a href="https://github.com/IlyaBOT/MeshShare">https://github.com/IlyaBOT/MeshShare</a>
+• <b>Документация Meshtastic:</b> <a href="https://meshtastic.org/docs/">https://meshtastic.org/docs/</a>
 
-Чтобы узнать больше о функциях и возможностях приложения и сети Meshtastic, используйте нашу официальную документацию:
-<a href="https://meshtastic.org/docs/">Читать документацию</a>
-
-<b>Переводы</b>
-
-Вы можете помочь с переводом приложения на ваш родной язык с помощью Crowdin:
-<a href="https://crowdin.meshtastic.org/android">https://crowdin.meshtastic.org/android</a>
+MeshShare — независимая модификация GPL-проекта <a href="https://github.com/meshtastic/Meshtastic-Android">Meshtastic Android</a>. Прошивка, протокол и ресурсы сообщества Meshtastic остаются upstream-проектами.

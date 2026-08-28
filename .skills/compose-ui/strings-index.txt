@@ -123,6 +123,7 @@ bandwidth_option_khz
 bandwidth_unsupported
 bandwidth_unsupported_summary
 baro_pressure
+based_on_meshtastic_android
 battery
 battery_ina_2xx_i2c_address
 ble_devices
@@ -1074,6 +1075,10 @@ mesh_beacon_target_remove
 mesh_beacon_targets
 mesh_map_location
 mesh_map_location_description
+meshshare_app_name
+meshshare_desktop_tray_tooltip
+meshshare_desktop_update_available_message
+meshshare_version
 ### MESHTASTIC ###
 meshtastic
 meshtastic_alerts_notifications
@@ -1845,6 +1850,7 @@ update_interval_seconds
 updated
 uplink_enabled
 uplink_feature_description
+upstream_repository
 uptime
 ### URL ###
 url
@@ -1885,6 +1891,8 @@ waypoint_new
 waypoint_received
 website
 weight
+what_is_meshshare
+what_is_meshshare_description
 what_is_meshtastic
 what_is_meshtastic_description
 ### WIFI ###

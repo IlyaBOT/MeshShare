@@ -68,7 +68,7 @@ val generateBuildConfig =
             |package org.meshtastic.desktop
             |
             |/**
-            | * Auto-generated build configuration for Meshtastic Desktop.
+            | * Auto-generated build configuration for MeshShare Desktop.
             | * Do not edit — values are derived from config.properties and git at build time.
             | */
             |object DesktopBuildConfig {
@@ -139,8 +139,8 @@ compose.desktop {
                 "-Xmx2G",
                 // Let the macOS title bar follow the system light/dark theme (ignored on other OSes).
                 "-Dapple.awt.application.appearance=system",
-                "-Dapple.awt.application.name=Meshtastic Desktop",
-                "-Dcom.apple.mrj.application.apple.menu.about.name=Meshtastic Desktop",
+                "-Dapple.awt.application.name=MeshShare",
+                "-Dcom.apple.mrj.application.apple.menu.about.name=MeshShare",
                 "-Dcom.apple.bundle.identifier=org.meshtastic.MeshtasticDesktop",
             )
         jvmArgs(*desktopJvmArgs.toTypedArray())
@@ -159,7 +159,7 @@ compose.desktop {
         }
 
         nativeDistributions {
-            packageName = "Meshtastic Desktop"
+            packageName = "MeshShare"
 
             // Ensure critical JVM modules are included in the custom JRE bundled with the app.
             // jdeps might miss some of these if they are loaded via reflection or JNI.
@@ -227,7 +227,7 @@ compose.desktop {
             }
             windows {
                 iconFile.set(project.file("src/main/resources/icon.ico"))
-                menuGroup = "Meshtastic"
+                menuGroup = "MeshShare"
                 shortcut = true
                 menu = true
                 dirChooser = true
@@ -257,8 +257,8 @@ compose.desktop {
             val sanitizedVersion = Regex("^\\d+\\.\\d+\\.\\d+").find(versionInfo.versionName)?.value ?: "1.0.0"
             packageVersion = sanitizedVersion
 
-            description = "Meshtastic Desktop Application"
-            vendor = "Meshtastic LLC"
+            description = "MeshShare Meshtastic-compatible off-grid messaging client"
+            vendor = "MeshShare contributors"
         }
     }
 }
