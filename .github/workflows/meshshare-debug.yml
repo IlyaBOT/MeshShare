@@ -15,6 +15,9 @@ concurrency:
 jobs:
   build-debug-apk:
     uses: ./.github/workflows/reusable-check.yml
+    permissions:
+      contents: read
+      pull-requests: write
     with:
       run_lint: false
       run_screenshot_tests: false
